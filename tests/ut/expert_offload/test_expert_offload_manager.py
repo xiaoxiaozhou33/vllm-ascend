@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -21,6 +22,21 @@ def _manager_for_prediction(next_layer, gate_weight, *, topk=2,
     manager._gate_weights_npu = [None, gate_weight]
     manager.topk = topk
     manager.prefetch_topk = prefetch_topk
+    return manager
+
+
+def _manager_for_mc_debug():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._debug = True
+    manager._ep_size = 16
+    manager._ep_rank = 8
+    manager._ep_info_resolved = True
+    manager._mc_debug_lock = threading.Lock()
+    manager._mc_debug_schedule_seq = 0
+    manager._mc_debug_callback_seq = 0
+    manager._mc_debug_collective_seq = 0
+    manager._mc_debug_active_callbacks = 0
+    manager._mc_debug_layer_calls = {}
     return manager
 
 
@@ -136,6 +152,99 @@ def test_multi_card_lrc_log_exposes_cross_rank_checksums():
     assert args[-1][0]["expert"] == 1
     assert args[-1][0]["count"] == 2
     assert args[-1][0]["freq"] == 5
+
+
+def test_mc_debug_callback_log_exposes_sequence_and_reentry():
+    manager = _manager_for_mc_debug()
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+    ) as log_info:
+        first = manager._begin_mc_debug_callback(39, False, True)
+        second = manager._begin_mc_debug_callback(40, False, True)
+        manager._end_mc_debug_callback(second, "ok")
+        manager._end_mc_debug_callback(first, "ok")
+
+    assert first["callback_seq"] == 1
+    assert first["layer_call"] == 1
+    assert second["callback_seq"] == 2
+    assert manager._mc_debug_active_callbacks == 0
+    events = [entry.args[1] for entry in log_info.call_args_list]
+    assert events == ["CB_ENTER", "CB_ENTER", "CB_EXIT", "CB_EXIT"]
+    assert "active_callbacks=2" in log_info.call_args_list[1].args[-1]
+
+
+def test_mc_debug_gloo_log_pairs_collective_sequences():
+    manager = _manager_for_mc_debug()
+    context = manager._begin_mc_debug_callback(39, False, True)
+    cpu_group = SimpleNamespace(group_name="ep_offload")
+    local_values = torch.tensor([1, 2], dtype=torch.int64)
+
+    with patch(
+        "vllm_ascend.expert_offload.multi_card_planner."
+        "gather_global_counts_cpu",
+        side_effect=lambda values, group: values + 1,
+    ), patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+    ) as log_info:
+        counts = manager._gather_cpu_with_mc_debug(
+            local_values, cpu_group, "count", context)
+        scores = manager._gather_cpu_with_mc_debug(
+            local_values.float(), cpu_group, "router_score", context)
+
+    assert torch.equal(counts, torch.tensor([2, 3]))
+    assert torch.equal(scores, torch.tensor([2.0, 3.0]))
+    events = [entry.args[1] for entry in log_info.call_args_list]
+    assert events == ["GLOO_ENTER", "GLOO_EXIT",
+                      "GLOO_ENTER", "GLOO_EXIT"]
+    assert "kind=count" in log_info.call_args_list[0].args[-1]
+    assert "collective_seq=1" in log_info.call_args_list[0].args[-1]
+    assert "kind=router_score" in log_info.call_args_list[2].args[-1]
+    assert "collective_seq=2" in log_info.call_args_list[2].args[-1]
+
+
+def test_mc_debug_callback_logs_python_error_and_exit():
+    manager = _manager_for_mc_debug()
+    manager._update_weights_multi_card_impl = MagicMock(
+        side_effect=RuntimeError("debug failure"))
+    args = (
+        None, None, None, 39, 16, False, None, False, None, "softmax",
+        None, None, True,
+    )
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+    ) as log_info:
+        try:
+            manager._update_weights_multi_card(args)
+        except RuntimeError as exc:
+            assert str(exc) == "debug failure"
+        else:
+            raise AssertionError("expected RuntimeError")
+
+    events = [entry.args[1] for entry in log_info.call_args_list]
+    assert events == ["CB_ENTER", "CB_ERROR", "CB_EXIT"]
+    assert "status=error:RuntimeError" in log_info.call_args_list[-1].args[-1]
+    assert manager._mc_debug_active_callbacks == 0
+
+
+def test_mc_debug_disabled_uses_uninstrumented_fast_path():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._debug = False
+    manager._update_weights_multi_card_impl = MagicMock(return_value="done")
+    args = (
+        None, None, None, 39, 16, False, None, False, None, "softmax",
+        None, None,
+    )
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+    ) as log_info:
+        result = manager._update_weights_multi_card(args)
+
+    assert result == "done"
+    manager._update_weights_multi_card_impl.assert_called_once_with(args)
+    log_info.assert_not_called()
 
 
 def test_multi_card_decode_plan_log_is_emitted_only_by_rank_zero():
@@ -511,6 +620,10 @@ def test_prefetch_dispatch_uses_single_or_per_layer_multi_card_capacity():
     assert multi_fn is manager._update_weights_multi_card
     assert multi_args[4] == 6
     assert multi_args[-2:] == (True, None)
+
+    manager._debug = True
+    _, debug_multi_args = manager._build_prefetch_call(*inputs)
+    assert debug_multi_args[-3:] == (True, None, False)
 
 
 def test_shared_expert_copy_is_non_blocking_and_refreshes_quant_scale():

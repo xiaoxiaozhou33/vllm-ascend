@@ -185,6 +185,16 @@ class ExpertOffloadManager:
         # Flipping it on surfaces them at info level (no need for global
         # VLLM_LOGGING_LEVEL=DEBUG).
         self._debug = self.offload_config.moe_offload_debug
+        # Graph/collective diagnostics. Host callbacks may execute on report
+        # threads, so keep the counters under a small CPU-only lock. These
+        # fields are touched only when moe_offload_debug is enabled and never
+        # read device tensors or introduce another distributed collective.
+        self._mc_debug_lock = threading.Lock()
+        self._mc_debug_schedule_seq = 0
+        self._mc_debug_callback_seq = 0
+        self._mc_debug_collective_seq = 0
+        self._mc_debug_active_callbacks = 0
+        self._mc_debug_layer_calls: dict[tuple[int, bool], int] = {}
 
         # Diagnostic: wall time of the parallel weight-load phase (safetensors
         # → pinned CPU buffers). Logged in _finalize_offload.
@@ -1655,6 +1665,133 @@ class ExpertOffloadManager:
                     self.mc_shard_size, self.ep_rank)
         return True
 
+    def _log_mc_debug_event(self, event: str, context=None, **details) -> None:
+        """Emit one parseable CPU-only multi-card diagnostic record."""
+        if not self._debug:
+            return
+        context = context or {}
+        details_text = " ".join(
+            f"{key}={value}" for key, value in details.items())
+        logger.info(
+            "[MC_DEBUG] event=%s rank=%s layer=%s layer_call=%s "
+            "callback_seq=%s source=%s prefetch=%s pid=%s thread=%s "
+            "ts_ns=%s %s",
+            event,
+            self.ep_rank,
+            context.get("layer_idx", "-"),
+            context.get("layer_call", "-"),
+            context.get("callback_seq", "-"),
+            context.get("source", "-"),
+            context.get("is_prefetch", False),
+            os.getpid(),
+            threading.get_ident(),
+            time.time_ns(),
+            details_text,
+        )
+
+    def _log_mc_debug_schedule(self, layer_idx: int,
+                               is_prefetch: bool) -> None:
+        if not self._debug:
+            return
+        with self._mc_debug_lock:
+            self._mc_debug_schedule_seq += 1
+            schedule_seq = self._mc_debug_schedule_seq
+        self._log_mc_debug_event(
+            "CB_SCHEDULE",
+            {
+                "layer_idx": layer_idx,
+                "source": "graph_callback",
+                "is_prefetch": is_prefetch,
+            },
+            schedule_seq=schedule_seq,
+        )
+
+    def _begin_mc_debug_callback(self, layer_idx: int, is_prefetch: bool,
+                                 from_graph_callback: bool):
+        if not self._debug:
+            return None
+        with self._mc_debug_lock:
+            self._mc_debug_callback_seq += 1
+            callback_seq = self._mc_debug_callback_seq
+            layer_key = (layer_idx, is_prefetch)
+            layer_call = self._mc_debug_layer_calls.get(layer_key, 0) + 1
+            self._mc_debug_layer_calls[layer_key] = layer_call
+            self._mc_debug_active_callbacks += 1
+            active_callbacks = self._mc_debug_active_callbacks
+        context = {
+            "layer_idx": layer_idx,
+            "layer_call": layer_call,
+            "callback_seq": callback_seq,
+            "source": ("graph_callback" if from_graph_callback
+                       else "eager_inline"),
+            "is_prefetch": is_prefetch,
+            "start_ns": time.perf_counter_ns(),
+        }
+        self._log_mc_debug_event(
+            "CB_ENTER", context, active_callbacks=active_callbacks)
+        return context
+
+    def _end_mc_debug_callback(self, context, status: str) -> None:
+        if context is None:
+            return
+        with self._mc_debug_lock:
+            self._mc_debug_active_callbacks = max(
+                0, self._mc_debug_active_callbacks - 1)
+            active_callbacks = self._mc_debug_active_callbacks
+        elapsed_us = (time.perf_counter_ns() - context["start_ns"]) // 1000
+        self._log_mc_debug_event(
+            "CB_EXIT",
+            context,
+            status=status,
+            active_callbacks=active_callbacks,
+            elapsed_us=elapsed_us,
+        )
+
+    def _gather_cpu_with_mc_debug(self, local_values, cpu_group, kind: str,
+                                  context):
+        """Wrap one Gloo all-reduce with enter/exit sequence diagnostics."""
+        from vllm_ascend.expert_offload.multi_card_planner import (
+            gather_global_counts_cpu)
+
+        if context is None:
+            return gather_global_counts_cpu(local_values, cpu_group)
+        with self._mc_debug_lock:
+            self._mc_debug_collective_seq += 1
+            collective_seq = self._mc_debug_collective_seq
+        start_ns = time.perf_counter_ns()
+        group_name = getattr(cpu_group, "group_name", "none")
+        group_id = hex(id(cpu_group)) if cpu_group is not None else "none"
+        self._log_mc_debug_event(
+            "GLOO_ENTER",
+            context,
+            kind=kind,
+            collective_seq=collective_seq,
+            group_name=group_name,
+            local_group_id=group_id,
+            dtype=local_values.dtype,
+            numel=local_values.numel(),
+        )
+        try:
+            global_values = gather_global_counts_cpu(local_values, cpu_group)
+        except BaseException as exc:
+            self._log_mc_debug_event(
+                "GLOO_ERROR",
+                context,
+                kind=kind,
+                collective_seq=collective_seq,
+                error_type=type(exc).__name__,
+            )
+            raise
+        elapsed_us = (time.perf_counter_ns() - start_ns) // 1000
+        self._log_mc_debug_event(
+            "GLOO_EXIT",
+            context,
+            kind=kind,
+            collective_seq=collective_seq,
+            elapsed_us=elapsed_us,
+        )
+        return global_values
+
     def update_weights_multi_card(self, layer, topk_ids, log2phy,
                                   topk_weights=None, hidden_states=None,
                                   mc2_mask=None,
@@ -1708,9 +1845,10 @@ class ExpertOffloadManager:
         # topk) or inline (eager), H2D log2phy back. The host callback's
         # load_stream.synchronize() gates the compute stream until H2D is done.
         # The cross-rank expert-count all_reduce uses gloo cpu_group
-        # (get_ep_group().cpu_group) — stream-independent, so it runs inside the
-        # host callback. HCCL all_reduce CANNOT be a captured graph op, and the
-        # planner needs the counts on host anyway.
+        # (get_ep_group().cpu_group), while HCCL all_reduce cannot be a captured
+        # graph op and the planner needs the counts on host. Every EP rank must
+        # still enter the Gloo collectives in exactly the same order; MC_DEBUG
+        # traces that ordering across graph host callbacks.
         per_rank_slots = self.offload_config.num_device_experts_for_rank(
             layer_idx, self.ep_size)
         topk_ids_h = self.topk_ids_h[:num_tokens]
@@ -1769,12 +1907,16 @@ class ExpertOffloadManager:
             topk_weights_h = self.topk_weights_h[:num_tokens]
             topk_weights_h.copy_(topk_weights.to(dtype=torch.float32),
                                  non_blocking=_EXTRA_CTX.capturing)
+        from_graph_callback = _EXTRA_CTX.capturing
         args = (
             topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots, False,
             mc2_mask_h, do_substitution, router_logits_h, scoring_func,
             correction_bias_h, topk_weights_h,
         )
-        if _EXTRA_CTX.capturing:
+        if self._debug:
+            args += (from_graph_callback,)
+        if from_graph_callback:
+            self._log_mc_debug_schedule(layer_idx, is_prefetch=False)
             torch_npu.npu._launch_host_func(
                 current_compute_stream, self._update_weights_multi_card, args)
         else:
@@ -1885,6 +2027,28 @@ class ExpertOffloadManager:
         topk_ids_h.index_copy_(0, active_rows, updated_ids)
 
     def _update_weights_multi_card(self, args):
+        """Trace and run one multi-card decode callback or eager update."""
+        if not self._debug:
+            return self._update_weights_multi_card_impl(args)
+        layer_idx = args[3]
+        is_prefetch = bool(args[5])
+        from_graph_callback = (
+            (len(args) == 8 and bool(args[7]))
+            or (len(args) == 13 and bool(args[12])))
+        context = self._begin_mc_debug_callback(
+            layer_idx, is_prefetch, from_graph_callback)
+        status = "ok"
+        try:
+            return self._update_weights_multi_card_impl(args, context)
+        except BaseException as exc:
+            status = f"error:{type(exc).__name__}"
+            self._log_mc_debug_event(
+                "CB_ERROR", context, error_type=type(exc).__name__)
+            raise
+        finally:
+            self._end_mc_debug_callback(context, status)
+
+    def _update_weights_multi_card_impl(self, args, debug_context=None):
         """Host callback (graph replay) / inline (eager) for multi-card DECODE
         placement + H2D. Reads the pinned CPU topk_ids_h, does CPU bincount +
         gloo all_reduce (cpu_group) for global expert counts, plans the
@@ -1892,15 +2056,15 @@ class ExpertOffloadManager:
         the compute stream), and writes placement.log2phy into the pinned
         log2phy_h (the wrapper H2D-copies it back to the NPU tensor).
         """
-        if len(args) == 7:
+        if len(args) in (7, 8):
             (topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots,
-             is_prefetch, mc2_mask_h) = args
+             is_prefetch, mc2_mask_h) = args[:7]
             do_substitution = False
             topk_weights_h = None
         else:
             (topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots,
              is_prefetch, mc2_mask_h, do_substitution, router_logits_h,
-             scoring_func, correction_bias_h, topk_weights_h) = args
+             scoring_func, correction_bias_h, topk_weights_h) = args[:12]
         decode_start = time.perf_counter() if self._debug else None
         from vllm.distributed.parallel_state import get_ep_group
 
@@ -1941,7 +2105,8 @@ class ExpertOffloadManager:
         global_counts, cache_on, hotness, prev_log2phy = \
             self._gather_global_counts_and_hotness(layer_idx, topk_for_count,
                                                     cpu_group,
-                                                    weights_for_count)
+                                                    weights_for_count,
+                                                    debug_context)
         counts_ms = ((time.perf_counter() - counts_start) * 1000.0
                      if counts_start is not None else 0.0)
 
@@ -1996,7 +2161,8 @@ class ExpertOffloadManager:
             layer_idx, my_experts, cache_on, active_set)
         h2d_start = time.perf_counter() if self._debug and misses else None
         if misses:
-            self._h2d_load_mc_misses(layer, layer_idx, misses, resident_map)
+            self._h2d_load_mc_misses(layer, layer_idx, misses, resident_map,
+                                     debug_context)
         h2d_ms = ((time.perf_counter() - h2d_start) * 1000.0
                   if h2d_start is not None else 0.0)
         # Write the FULL global placement into the pinned log2phy_h; the wrapper
@@ -2107,19 +2273,22 @@ class ExpertOffloadManager:
             _stable_float_checksum(hotness), hot_sample)
 
     def _gather_global_counts_and_hotness(self, layer_idx, topk_ids_h,
-                                          cpu_group, topk_weights_h=None):
+                                          cpu_group, topk_weights_h=None,
+                                          debug_context=None):
         """CPU bincount + gloo all_reduce -> global expert counts, then update
         the LRC hotness policy (the same one single-card uses: recent freq +
         EMA + age + optional router score) from the real GLOBAL route counts
         and return its per-expert hotness. global_counts and router score sums
         are all-reduced EVERY step (identical across ranks after the mc2_mask
         filter), so the LRC state + hotness are too -> placement/eviction stay
-        deterministic. gloo runs on cpu_group (stream/graph-independent, safe
-        inside the host callback)."""
+        deterministic. Gloo runs on cpu_group rather than the captured NPU
+        stream, but all callbacks must still enter its collectives in the same
+        order on every rank."""
         from vllm_ascend.expert_offload.multi_card_planner import (
-            local_expert_counts_cpu, gather_global_counts_cpu)
+            local_expert_counts_cpu)
         local_counts = local_expert_counts_cpu(topk_ids_h, self.num_total_experts)
-        global_counts = gather_global_counts_cpu(local_counts, cpu_group)
+        global_counts = self._gather_cpu_with_mc_debug(
+            local_counts, cpu_group, "count", debug_context)
         cache_on = self.offload_config.cache_policy_enabled
         if not cache_on:
             return global_counts, cache_on, None, None
@@ -2141,8 +2310,8 @@ class ExpertOffloadManager:
             local_score_sum = torch.zeros(self.num_total_experts,
                                           dtype=torch.float32)
             local_score_sum.scatter_add_(0, ids, scores)
-            global_score_sum = gather_global_counts_cpu(local_score_sum,
-                                                        cpu_group)
+            global_score_sum = self._gather_cpu_with_mc_debug(
+                local_score_sum, cpu_group, "router_score", debug_context)
             global_router_score = torch.zeros_like(global_score_sum)
             active = global_counts > 0
             global_router_score[active] = (
@@ -2200,14 +2369,47 @@ class ExpertOffloadManager:
             layer.w13_weight_scale_fp32[slot].copy_(
                 layer.w13_weight_scale.data[slot].to(torch.float32))
 
-    def _h2d_load_mc_misses(self, layer, layer_idx, misses, resident_map):
+    def _h2d_load_mc_misses(self, layer, layer_idx, misses, resident_map,
+                            debug_context=None):
         """H2D-load missed experts (w13/w2 + quant attrs) into their slots on
         load_stream, then synchronize to gate the compute stream."""
-        with torch_npu.npu.stream(self.load_stream):
-            for slot, eid in misses:
-                self._load_expert_weights_into_slot(layer, layer_idx, eid, slot)
-                resident_map[slot] = eid
-            self.load_stream.synchronize()
+        if not self._debug:
+            with torch_npu.npu.stream(self.load_stream):
+                for slot, eid in misses:
+                    self._load_expert_weights_into_slot(
+                        layer, layer_idx, eid, slot)
+                    resident_map[slot] = eid
+                self.load_stream.synchronize()
+            return
+        start_ns = time.perf_counter_ns()
+        self._log_mc_debug_event(
+            "H2D_ENTER", debug_context, misses=len(misses))
+        try:
+            with torch_npu.npu.stream(self.load_stream):
+                for slot, eid in misses:
+                    self._load_expert_weights_into_slot(
+                        layer, layer_idx, eid, slot)
+                    resident_map[slot] = eid
+                self._log_mc_debug_event(
+                    "H2D_SYNC_ENTER", debug_context, misses=len(misses))
+                self.load_stream.synchronize()
+                self._log_mc_debug_event(
+                    "H2D_SYNC_EXIT", debug_context, misses=len(misses))
+        except BaseException as exc:
+            self._log_mc_debug_event(
+                "H2D_ERROR",
+                debug_context,
+                misses=len(misses),
+                error_type=type(exc).__name__,
+            )
+            raise
+        elapsed_us = (time.perf_counter_ns() - start_ns) // 1000
+        self._log_mc_debug_event(
+            "H2D_EXIT",
+            debug_context,
+            misses=len(misses),
+            elapsed_us=elapsed_us,
+        )
 
     def _log_mc_decode_cache(self, layer_idx, my_experts, hits, misses,
                              resident_map, log2phy, per_rank_slots,
@@ -2610,6 +2812,9 @@ class ExpertOffloadManager:
                 
 
             if _EXTRA_CTX.capturing:
+                if self.enable_multi_card:
+                    self._log_mc_debug_schedule(
+                        next_idx, is_prefetch=True)
                 torch_npu.npu._launch_host_func(
                     current_compute_stream, _prefetch_host_cb, prefetch_args)
             else:
@@ -2661,9 +2866,12 @@ class ExpertOffloadManager:
             # placement is corrected by the next layer's reactive update
             # (which does filter), and prefetch calls are excluded from
             # hit-rate stats via is_prefetch=True.
-            return self._update_weights_multi_card, (
+            args = (
                 topk_ids_h, log2phy_h, next_layer, next_idx, per_rank_slots,
                 True, None)
+            if getattr(self, "_debug", False):
+                args += (_EXTRA_CTX.capturing,)
+            return self._update_weights_multi_card, args
         return self._update_weights, (
             topk_ids_h, log2phy_np, next_layer, next_idx, topk_weights_h,
             self._is_prefetch)
