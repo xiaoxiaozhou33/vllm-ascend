@@ -968,6 +968,10 @@ class ExpertOffloadConfig:
         "hot_experts_file": "",
         "expert_substitution_enabled": False,
         "expert_substitution_threshold": 0.25,
+        # Test mode: let the module-level PrefetchOffloader own full-size
+        # duplicate expert params (w13_weight_full etc.) for the prefill
+        # phase while this manager keeps handling decode. Fully isolated.
+        "prefill_module_prefetch": False,
     }
 
     def __init__(self, user_config: dict | None = None):
