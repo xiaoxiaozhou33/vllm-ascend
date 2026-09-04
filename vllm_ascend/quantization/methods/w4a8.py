@@ -568,6 +568,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         # producing garbled output (only the first num_device_experts are
         # resident on NPU when offload is enabled).
         use_prefill_pool = False
+        use_prefetch_full = False
         prefill_slot = -1
         num_tokens = topk_ids.size(0)
         if getattr(layer, 'enable_expert_offload', False):
@@ -615,7 +616,14 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             if (prefill_regime
                     and mgr._prefill_initialized
                     and (is_mc or not mgr._skip_prefill)):
-                use_prefill_pool = True
+                if (mgr.offload_config.prefill_module_prefetch
+                        and getattr(layer, "_prefetch_full_ready", False)):
+                    # [dual-offload] Prefill weights come from the
+                    # PrefetchOffloader's static buffers (full-size params);
+                    # the manager's pool was not loaded for this layer.
+                    use_prefetch_full = True
+                else:
+                    use_prefill_pool = True
                 try:
                     layer_idx = mgr.moe_layers.index(layer)
                 except ValueError:
@@ -623,20 +631,33 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 prefill_slot = layer_idx % len(mgr._prefill_w13)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
-        if use_prefill_pool:
+        if use_prefill_pool or use_prefetch_full:
             # Prefill pool holds all experts; swap weight references to the
             # pool and use an identity log2phy. Weight tensors are int32
             # (liar tensors with NZ storage) matching the decode path.
-            w1 = [mgr._prefill_w13[prefill_slot]]
-            w1_scale = [mgr._prefill_w13_scale[prefill_slot]]
-            w2 = [mgr._prefill_w2[prefill_slot]]
-            w2_scale = [mgr._prefill_w2_scale[prefill_slot]]
-            if mgr._prefill_w13_scale_bias and mgr._prefill_w2_scale_bias:
-                w1_scale_bias = [mgr._prefill_w13_scale_bias[prefill_slot]]
-                w2_scale_bias = [mgr._prefill_w2_scale_bias[prefill_slot]]
+            if use_prefetch_full:
+                # [dual-offload] Read the PrefetchOffloader-owned full-size
+                # params (static buffers via the prefetch pipeline, or
+                # resident NPU copies).
+                w1 = [layer.w13_weight_full.data]
+                w1_scale = [layer.w13_weight_scale_full.data]
+                w2 = [layer.w2_weight_full.data]
+                w2_scale = [layer.w2_weight_scale_full.data]
+                w13_sb = getattr(layer, "w13_scale_bias_full", None)
+                w2_sb = getattr(layer, "w2_scale_bias_full", None)
+                w1_scale_bias = [w13_sb.data] if w13_sb is not None else None
+                w2_scale_bias = [w2_sb.data] if w2_sb is not None else None
             else:
-                w1_scale_bias = None
-                w2_scale_bias = None
+                w1 = [mgr._prefill_w13[prefill_slot]]
+                w1_scale = [mgr._prefill_w13_scale[prefill_slot]]
+                w2 = [mgr._prefill_w2[prefill_slot]]
+                w2_scale = [mgr._prefill_w2_scale[prefill_slot]]
+                if mgr._prefill_w13_scale_bias and mgr._prefill_w2_scale_bias:
+                    w1_scale_bias = [mgr._prefill_w13_scale_bias[prefill_slot]]
+                    w2_scale_bias = [mgr._prefill_w2_scale_bias[prefill_slot]]
+                else:
+                    w1_scale_bias = None
+                    w2_scale_bias = None
             # Override local expert count so kernel groupList matches pool.
             # Single-card uses AllGather dispatcher (num_experts_local); multi-card
             # prefill uses All2All dispatcher (num_local_experts + derived indices),
@@ -754,10 +775,11 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         # (decode path only) so compute_event captures real GMM work.
         if (getattr(layer, 'enable_expert_offload', False)
                 and not use_prefill_pool
+                and not use_prefetch_full
                 and num_tokens <= mgr.offload_threshold):
             mgr.trigger_next_layer_prefetch(layer, x)
         # Restore decode-path expert count after prefill override.
-        if use_prefill_pool:
+        if use_prefill_pool or use_prefetch_full:
             layer.moe_config.num_local_experts = _saved_nle
             layer.local_num_experts = _saved_lne
             td = moe_comm_method.token_dispatcher

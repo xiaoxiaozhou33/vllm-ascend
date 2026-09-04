@@ -239,6 +239,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         # log2phy. Multi-card decode uses dynamic MC2 placement, while
         # multi-card prefill loads this rank's EP shard into the prefill pool.
         use_prefill_pool = False
+        use_prefetch_full = False
         prefill_slot = -1
         num_tokens = topk_ids.size(0)
         enable_expert_offload = getattr(layer, "enable_expert_offload", False)
@@ -285,21 +286,36 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 and mgr._prefill_initialized
                 and (enable_multi_card or not mgr._skip_prefill)
             ):
-                use_prefill_pool = True
-                try:
-                    layer_idx = mgr.moe_layers.index(layer)
-                except ValueError:
-                    layer_idx = 0
-                prefill_slot = layer_idx % len(mgr._prefill_w13)
+                if (
+                    mgr.offload_config.prefill_module_prefetch
+                    and getattr(layer, "_prefetch_full_ready", False)
+                ):
+                    # [dual-offload test] Prefill weights come from the
+                    # PrefetchOffloader's static buffers (full-size params);
+                    # the manager's pool was not loaded for this layer.
+                    use_prefetch_full = True
+                else:
+                    use_prefill_pool = True
+                    try:
+                        layer_idx = mgr.moe_layers.index(layer)
+                    except ValueError:
+                        layer_idx = 0
+                    prefill_slot = layer_idx % len(mgr._prefill_w13)
 
         moe_comm_method = forward_context.moe_comm_method
-        if use_prefill_pool:
+        if use_prefill_pool or use_prefetch_full:
             # W4A8_MXFP's MoE path expects single tensors, so unlike W4A8 the
             # pool weights and scales must not be wrapped in lists.
-            w1 = mgr._prefill_w13[prefill_slot]
-            w2 = mgr._prefill_w2[prefill_slot]
-            w1_scale = mgr._prefill_w13_scale[prefill_slot]
-            w2_scale = mgr._prefill_w2_scale[prefill_slot]
+            if use_prefetch_full:
+                w1 = layer.w13_weight_full.data
+                w2 = layer.w2_weight_full.data
+                w1_scale = layer.w13_weight_scale_full.data
+                w2_scale = layer.w2_weight_scale_full.data
+            else:
+                w1 = mgr._prefill_w13[prefill_slot]
+                w2 = mgr._prefill_w2[prefill_slot]
+                w1_scale = mgr._prefill_w13_scale[prefill_slot]
+                w2_scale = mgr._prefill_w2_scale[prefill_slot]
             _saved_nle = layer.moe_config.num_local_experts
             _saved_lne = layer.local_num_experts
             token_dispatcher = moe_comm_method.token_dispatcher
@@ -346,7 +362,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
 
         # Trigger next-layer expert prefetch only after the GMM kernel has been
         # submitted, so the recorded compute event covers the current layer.
-        if enable_expert_offload and not use_prefill_pool and num_tokens <= mgr.offload_threshold:
+        if enable_expert_offload and not use_prefill_pool and not use_prefetch_full and num_tokens <= mgr.offload_threshold:
             mgr.trigger_next_layer_prefetch(layer, x)
 
         if enable_expert_offload:
@@ -382,7 +398,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             # The dispatcher is shared across layers. Restore decode state even
             # when the prefill kernel raises, otherwise later requests inherit
             # the temporary EP-shard configuration.
-            if use_prefill_pool:
+            if use_prefill_pool or use_prefetch_full:
                 layer.moe_config.num_local_experts = _saved_nle
                 layer.local_num_experts = _saved_lne
                 if _saved_dispatcher_state["num_experts_local"] is not None:

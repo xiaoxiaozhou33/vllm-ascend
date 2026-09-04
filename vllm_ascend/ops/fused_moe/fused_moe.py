@@ -731,8 +731,14 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             self._quant_method.create_weights(layer=self.routed_experts,
                                              **_offload_moe_quant_params)
             from vllm_ascend.expert_offload import ExpertOffloadManager
-            ExpertOffloadManager.get_instance().init_layer_cpu_buffers(
+            _offload_mgr = ExpertOffloadManager.get_instance()
+            _offload_mgr.init_layer_cpu_buffers(
                 self.routed_experts, self.moe_instance_id)
+            # [dual-offload test] Full-size duplicate expert params owned
+            # exclusively by the module-level PrefetchOffloader (prefill
+            # phase); the manager keeps the shrunk decode slots untouched.
+            if _offload_mgr.offload_config.prefill_module_prefetch:
+                self._create_prefetch_full_params(_offload_mgr)
 
         # Register this MoE layer with EPLB for PP compatibility.
         # PPMissingLayer (nn.Identity) never calls AscendFusedMoE.__init__,
@@ -744,6 +750,115 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         if self._ascend_runtime_activation is not None:
             return self._ascend_runtime_activation
         return super().activation
+
+    def _create_prefetch_full_params(self, mgr):
+        """[dual-offload] Create full-size duplicate expert params on
+        routed_experts, owned exclusively by the module-level
+        PrefetchOffloader for the prefill phase.
+
+        Supports the same formats as the manager's prefill pool
+        (_cast_prefill_pool_format): uint8 (W4A8_MXFP4), int8
+        (W8A8_DYNAMIC), int32 (W4A8 packed). Weight shapes mirror the
+        manager's CPU expert buffers (transpose of the create_weights
+        layout); scale layouts mirror the pool slots each apply() reads
+        (mxfp4 keeps its 4D antiquant layout; w8a8_dynamic uses a flat fp32
+        w13 scale + source-dtype w2 scale; w4a8 uses per-channel scales +
+        scale_bias). Bytes are filled later by
+        ExpertOffloadManager._fill_prefetch_full_params() (which runs before
+        offloader.post_init(), i.e. while param.data is still the prefetch
+        pinned CPU storage). The checkpoint loader never touches these —
+        they match no weight mapping.
+        """
+        re = self.routed_experts
+        w13 = getattr(re, "w13_weight_packed", None)
+        if w13 is None:
+            w13 = getattr(re, "w13_weight", None)
+        w2 = getattr(re, "w2_weight_packed", None)
+        if w2 is None:
+            w2 = getattr(re, "w2_weight", None)
+        _supported = (torch.uint8, torch.int8, torch.int32)
+        if (w13 is None or w2 is None or w13.dtype not in _supported
+                or w2.dtype != w13.dtype):
+            logger.warning_once(
+                "[OFFLOAD] prefill_module_prefetch: unsupported weight "
+                "dtype (%s) — full-size params not created; prefill falls "
+                "back to the pool path",
+                getattr(w13, "dtype", None))
+            return
+        ep_size = mgr.ep_size if self.enable_multi_card else 1
+        shard = self.global_num_experts // max(1, ep_size)
+        # Post-process per-expert weight layout is the transpose of the
+        # create_weights layout — same shape math as the manager's
+        # init_layer_cpu_buffers (w13_shape = (shape[2], shape[1])).
+        re.w13_weight_full = torch.nn.Parameter(
+            torch.empty((shard, w13.shape[2], w13.shape[1]),
+                        dtype=w13.dtype, device=w13.device),
+            requires_grad=False)
+        re.w2_weight_full = torch.nn.Parameter(
+            torch.empty((shard, w2.shape[2], w2.shape[1]),
+                        dtype=w2.dtype, device=w2.device),
+            requires_grad=False)
+        # The prefill GMM kernels require NZ-format weights; the exact
+        # recipe per dtype mirrors the pool's _cast_prefill_pool_format
+        # (uint8 -> format-50 fp4 recipe, int8/int32 -> format-29, int32 via
+        # int8 backing). These params never sit on NPU in NZ form, so
+        # device-side detection can't see them — mark them explicitly.
+        from vllm_ascend.model_executor.offloader.prefetch import (
+            _kernel_nz_format_for, mark_prefetch_offload_nz_weight)
+        nz_format = _kernel_nz_format_for(w13.dtype)
+        mark_prefetch_offload_nz_weight(re.w13_weight_full, nz_format)
+        mark_prefetch_offload_nz_weight(re.w2_weight_full, nz_format)
+
+        def _full_param(src, dtype):
+            per = src.numel() // max(1, src.shape[0])
+            return torch.nn.Parameter(
+                torch.empty((shard, per), dtype=dtype, device=src.device),
+                requires_grad=False)
+
+        if w13.dtype == torch.uint8:
+            # mxfp4 scales: create_weights layout (E, n, k) -> post-process
+            # (E, k//2, n, 2) via apply_mxfp4_weight_scale_layout (reshape
+            # (n, k//2, 2) then transpose(-3, -2) swaps the n and k//2 axes).
+            # aclnnGroupedMatmulWeightNz requires exactly this 4D layout
+            # (antiquantScale dim[2] must equal weight N); the pool slots and
+            # the manager's CPU scale buffers all use it.
+            for name in ("w13_weight_scale", "w2_weight_scale"):
+                dev_scale = getattr(re, name, None)
+                if dev_scale is None or dev_scale.ndim < 3:
+                    continue
+                n, k = dev_scale.shape[1], dev_scale.shape[2]
+                setattr(
+                    re, name + "_full",
+                    torch.nn.Parameter(torch.empty((shard, k // 2, n, 2),
+                                                   dtype=torch.uint8,
+                                                   device=dev_scale.device),
+                                       requires_grad=False))
+        elif w13.dtype == torch.int8:
+            # w8a8_dynamic: apply's prefill branch reads the fp32 w13 scale
+            # (mirrors _prefill_w13_scale_fp32) and the source-dtype w2
+            # scale (mirrors _prefill_w2_scale); both are flattened per
+            # expert by process_weights_after_loading's (E, -1) view.
+            s13 = getattr(re, "w13_weight_scale", None)
+            s2 = getattr(re, "w2_weight_scale", None)
+            if s13 is not None:
+                re.w13_weight_scale_full = _full_param(s13, torch.float32)
+            if s2 is not None:
+                re.w2_weight_scale_full = _full_param(s2, s2.dtype)
+        else:
+            # w4a8 (int32 packed): per-channel scales + optional scale_bias,
+            # same per-expert shapes/dtypes as the pool slots.
+            for name in ("w13_weight_scale", "w2_weight_scale",
+                         "w13_scale_bias", "w2_scale_bias"):
+                src = getattr(re, name, None)
+                if src is None:
+                    continue
+                per = src.numel() // max(1, src.shape[0])
+                setattr(
+                    re, name + "_full",
+                    torch.nn.Parameter(
+                        torch.empty((shard,) + tuple(src.shape[1:]),
+                                    dtype=src.dtype, device=src.device),
+                        requires_grad=False))
 
     def _wrap_weight_loader_for_offload(self):
         """Wrap weight_loader to intercept w13/w2 weights and store them on CPU.

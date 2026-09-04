@@ -1212,6 +1212,12 @@ class ExpertOffloadManager:
         t_hot = time.perf_counter()
         self.create_prefill_pool()
         t6 = time.perf_counter()
+        if self.offload_config.prefill_module_prefetch:
+            # [dual-offload test] Fill the PrefetchOffloader-owned full-size
+            # params from the finalized CPU buffers. Must run BEFORE
+            # offloader.post_init() (load_model ordering guarantees this) so
+            # param.data is still the prefetch pinned CPU storage.
+            self._fill_prefetch_full_params()
         if self.offload_config.expert_prefetch_enabled:
             self.register_gate_weights(model)
             # Pinned staging buffer for graph-mode prefetch: trigger_next_
@@ -3247,6 +3253,109 @@ class ExpertOffloadManager:
         self._refresh_prefill_fp32_scale(pool_slot, shard)
 
     # ------------------------------------------------------------------ #
+    #  Dual-offload test: fill PrefetchOffloader-owned full-size params    #
+    # ------------------------------------------------------------------ #
+    def _fill_prefetch_full_params(self):
+        """Fill w13_weight_full/w2_weight_full/*_scale_full from the
+        finalized CPU buffers (same bytes the prefill pool would get).
+
+        Runs inside _finalize_offload, BEFORE offloader.post_init(), so each
+        full param's .data is still the prefetch offloader's pinned CPU
+        storage; post_init's initial prefetch then H2Ds it into the static
+        buffers. Layers not wrapped by the offloader (group not selected,
+        MTP drafter) keep their empty NPU tensors and are skipped — apply()
+        falls back to the prefill pool for them (no _prefetch_full_ready) —
+        UNLESS prefill_module_prefetch_resident is on: their full params are
+        cast to the mxfp4 NZ recipe and filled as permanent NPU copies
+        (one-time H2D), making the offload-group selection yield truly
+        resident layers with zero per-forward copies.
+        """
+        t0 = time.perf_counter()
+        filled = 0
+        resident = 0
+        resident_bytes = 0
+        resident_enabled = (self.offload_config.prefill_module_prefetch
+                            and self.offload_config.prefill_module_prefetch_resident)
+        for layer_idx, layer in enumerate(self.moe_layers):
+            w13_full = getattr(layer, "w13_weight_full", None)
+            w2_full = getattr(layer, "w2_weight_full", None)
+            if w13_full is None or w2_full is None:
+                continue
+            on_npu = w13_full.data.device.type != "cpu"
+            if on_npu and not resident_enabled:
+                # Not wrapped by the prefetch offloader — skip.
+                continue
+            shard = w13_full.shape[0]
+            base = self.ep_rank * self.mc_shard_size
+            if on_npu:
+                # [dual-offload resident] The empty ND tensor must be cast to
+                # the kernel NZ format for this dtype (mirrors the pool's
+                # _cast_prefill_pool_format) before the NZ bytes land in it.
+                from vllm_ascend.model_executor.offloader.prefetch import (
+                    _cast_buffer_to_nz, _kernel_nz_format_for)
+                nz_format = _kernel_nz_format_for(w13_full.dtype)
+                if nz_format:
+                    w13_full.data = _cast_buffer_to_nz(
+                        w13_full.data, nz_format)
+                    w2_full.data = _cast_buffer_to_nz(
+                        w2_full.data, nz_format)
+            w13_dst = w13_full.data.untyped_storage()
+            w2_dst = w2_full.data.untyped_storage()
+            # Weights: raw storage bytes (post-process mxfp4 layout), same
+            # recipe as _prefill_load_layer_shard. CPU->CPU for wrapped
+            # layers, one-shot H2D for resident ones (same stream as init,
+            # so ordering before any forward read is guaranteed).
+            for local_i in range(shard):
+                geid = base + local_i
+                w13_dst[local_i * self.w13_expert_size_bytes:
+                        (local_i + 1) * self.w13_expert_size_bytes].copy_(
+                            self._expert_src_storage(layer_idx, geid, 'w13'))
+                w2_dst[local_i * self.w2_expert_size_bytes:
+                       (local_i + 1) * self.w2_expert_size_bytes].copy_(
+                           self._expert_src_storage(layer_idx, geid, 'w2'))
+            # Scales: per-expert buffers reshaped into the full params,
+            # per-format (mxfp4 keeps its encoded uint8 bytes as-is; w8a8's
+            # w13 full scale is fp32; w4a8 adds per-channel scale_bias).
+            is_mxfp4 = w13_full.dtype == torch.uint8
+            scale_names = (["w13_weight_scale", "w2_weight_scale"]
+                           + ([] if is_mxfp4 else
+                              ["w13_scale_bias", "w2_scale_bias"]))
+            cpu_store = {
+                "w13_weight_scale": self.scale_cpu_buffers,
+                "w2_weight_scale": self.scale_cpu_buffers,
+                "w13_scale_bias": self.scale_bias_cpu_buffers,
+                "w2_scale_bias": self.scale_bias_cpu_buffers,
+            }
+            for name in scale_names:
+                full = getattr(layer, name + "_full", None)
+                if full is None:
+                    continue
+                cpu_buffers = cpu_store[name].get(name)
+                if cpu_buffers is None or layer_idx >= len(cpu_buffers):
+                    continue
+                for local_i in range(shard):
+                    local_eid = self._shard_local(base + local_i)
+                    if (local_eid is None
+                            or local_eid >= len(cpu_buffers[layer_idx])):
+                        continue
+                    src = cpu_buffers[layer_idx][local_eid]
+                    dst = full.data[local_i]
+                    if src.dtype != dst.dtype:
+                        src = src.to(dst.dtype)
+                    dst.copy_(src.reshape(dst.shape))
+            layer._prefetch_full_ready = True
+            if on_npu:
+                resident += 1
+                resident_bytes += (w13_dst.nbytes() + w2_dst.nbytes())
+            else:
+                filled += 1
+        logger.info(
+            "[OFFLOAD] prefill_module_prefetch: filled full-size params for "
+            "%d/%d MoE layers (%d resident on NPU, %.2f GB) in %.1fs",
+            filled + resident, len(self.moe_layers), resident,
+            resident_bytes / 1e9, time.perf_counter() - t0)
+
+    # ------------------------------------------------------------------ #
     #  Forward path: page in experts based on topk_ids                    #
     # ------------------------------------------------------------------ #
 
@@ -3285,6 +3394,13 @@ class ExpertOffloadManager:
             return 0
         num_tokens = topk_ids.size(0)
         if num_tokens > self.offload_threshold:
+            # [dual-offload test] Prefill weights for this layer are served
+            # by the PrefetchOffloader's full-size params — skip the pool
+            # full-overwrite. Layers without _prefetch_full_ready (drafter,
+            # un-wrapped) keep the pool path.
+            if (self.offload_config.prefill_module_prefetch
+                    and getattr(layer, "_prefetch_full_ready", False)):
+                return 0
             # Prefill: layerwise reuse + full-overwrite of all experts
             if (self._prefill_initialized
                     and not self._skip_prefill):
@@ -3391,6 +3507,13 @@ class ExpertOffloadManager:
         if _EXTRA_CTX.moe_comm_type == MoECommType.MC2:
             return False
         if self._prefill_initialized:
+            # [dual-offload test] Layers whose full-size params were filled
+            # are served by the PrefetchOffloader in prefill — skip the pool
+            # shard load. Still return True (prefill regime handled).
+            if (self.offload_config.prefill_module_prefetch
+                    and getattr(self.moe_layers[layer_idx],
+                                "_prefetch_full_ready", False)):
+                return True
             self._prefill_load_layer_shard(layer_idx)
             if self._debug and logger.isEnabledFor(logging.DEBUG):
                 base = self.ep_rank * self.mc_shard_size

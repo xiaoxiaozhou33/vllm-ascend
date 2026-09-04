@@ -297,6 +297,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         act_name = getattr(activation, "value", activation)
         # Expert offload: incrementally page in needed experts, update log2phy
         use_prefill_pool = False
+        use_prefetch_full = False
         prefill_slot = -1
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
@@ -332,7 +333,14 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                     is_hash_routed=tid2eid is not None,
                 )
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
-                use_prefill_pool = True
+                if (mgr.offload_config.prefill_module_prefetch
+                        and getattr(layer, "_prefetch_full_ready", False)):
+                    # [dual-offload] Prefill weights come from the
+                    # PrefetchOffloader's static buffers (full-size params);
+                    # the manager's pool was not loaded for this layer.
+                    use_prefetch_full = True
+                else:
+                    use_prefill_pool = True
                 try:
                     layer_idx = mgr.moe_layers.index(layer)
                 except ValueError:
@@ -345,13 +353,22 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             and get_ascend_config().enable_fused_mc2 == 1
             and act_name != "swigluoai_uninterleave"
         )
-        if use_prefill_pool:
+        if use_prefill_pool or use_prefetch_full:
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
-            w1 = [mgr._prefill_w13[prefill_slot]]
-            w1_scale = [mgr._prefill_w13_scale_fp32[prefill_slot]]
-            w2 = [mgr._prefill_w2[prefill_slot]]
-            w2_scale = [mgr._prefill_w2_scale[prefill_slot]]
+            if use_prefetch_full:
+                # [dual-offload] Read the PrefetchOffloader-owned full-size
+                # params (already on NPU via the static-buffer pipeline or
+                # as resident copies).
+                w1 = [layer.w13_weight_full.data]
+                w1_scale = [layer.w13_weight_scale_full.data]
+                w2 = [layer.w2_weight_full.data]
+                w2_scale = [layer.w2_weight_scale_full.data]
+            else:
+                w1 = [mgr._prefill_w13[prefill_slot]]
+                w1_scale = [mgr._prefill_w13_scale_fp32[prefill_slot]]
+                w2 = [mgr._prefill_w2[prefill_slot]]
+                w2_scale = [mgr._prefill_w2_scale[prefill_slot]]
             w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
             w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
             # Override local expert count so kernel groupList matches prefill pool
@@ -420,10 +437,11 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         # so compute_event captures real GMM work for true overlap.
         if (getattr(layer, 'enable_expert_offload', False)
                 and not use_prefill_pool
+                and not use_prefetch_full
                 and num_tokens <= mgr.offload_threshold):
             mgr.trigger_next_layer_prefetch(layer, x)
         # Restore decode-path expert count after prefill override
-        if use_prefill_pool:
+        if use_prefill_pool or use_prefetch_full:
             layer.moe_config.num_local_experts = _saved_nle
             layer.local_num_experts = _saved_lne
             moe_comm_method.token_dispatcher.num_experts_local = _saved_td_nel
