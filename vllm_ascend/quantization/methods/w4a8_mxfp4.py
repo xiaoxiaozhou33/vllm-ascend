@@ -428,8 +428,12 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             # that buffer. Only transpose + scale layout here.
             w13_weight.data = w13_weight.data.transpose(1, 2)
             w2_weight.data = w2_weight.data.transpose(1, 2)
-            layer.w13_weight_scale.data = apply_mxfp4_weight_scale_layout(layer.w13_weight_scale.data)
-            layer.w2_weight_scale.data = apply_mxfp4_weight_scale_layout(layer.w2_weight_scale.data)
+            # .contiguous(): the layout transform returns a transposed view;
+            # the decode H2D refill writes the manager's post-layout bytes
+            # linearly into storage, which only matches the view semantics
+            # when the tensor is contiguous.
+            layer.w13_weight_scale.data = apply_mxfp4_weight_scale_layout(layer.w13_weight_scale.data).contiguous()
+            layer.w2_weight_scale.data = apply_mxfp4_weight_scale_layout(layer.w2_weight_scale.data).contiguous()
         else:
             w13_weight.data = torch_npu.npu_format_cast(
                 w13_weight.data, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
@@ -440,6 +444,6 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             w13_weight.data = w13_weight.data.transpose(1, 2)
             w2_weight.data = w2_weight.data.transpose(1, 2)
             g, n, k = layer.w13_weight_scale.shape
-            layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2)
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2).contiguous()
             g, n, k = layer.w2_weight_scale.shape
-            layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2)
+            layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2).contiguous()

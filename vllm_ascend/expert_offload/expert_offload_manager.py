@@ -1218,6 +1218,17 @@ class ExpertOffloadManager:
             # offloader.post_init() (load_model ordering guarantees this) so
             # param.data is still the prefetch pinned CPU storage.
             self._fill_prefetch_full_params()
+        # [debug-fix] Ensure offload slot scale tensors are contiguous 4D:
+        # the decode H2D refill writes storage linearly while the kernel
+        # reads via the (E, k//2, n, 2) view — these only agree when
+        # contiguous. Whatever upstream produced a transposed view, fix it
+        # here after all transforms are done.
+        for layer in self.moe_layers:
+            for attr in ("w13_weight_scale", "w2_weight_scale"):
+                t = getattr(layer, attr, None)
+                if (t is not None and t.ndim == 4
+                        and not t.data.is_contiguous()):
+                    t.data = t.data.contiguous()
         if self.offload_config.expert_prefetch_enabled:
             self.register_gate_weights(model)
             # Pinned staging buffer for graph-mode prefetch: trigger_next_
