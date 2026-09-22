@@ -164,6 +164,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             # routed_experts.forward_impl reads this to build the per-forward
             # rotation ctx (slot bind + L+1 prefetch) before MoE dispatch.
             routed_experts._expert_rotation_manager = rotation_manager
+            if rotation_manager.config.pre_sized:
+                # Wrap weight_loader + re-create device weights at the STATIC
+                # size BEFORE checkpoint loading, so the full-size transient
+                # never lands on device (single-card / tight-HBM deployments).
+                rotation_manager.pre_create_layer(self)
             original_process_weights = self._quant_method.process_weights_after_loading
 
             @wraps(original_process_weights)
