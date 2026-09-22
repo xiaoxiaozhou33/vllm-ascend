@@ -877,6 +877,14 @@ class AscendConfig:
                 "Please set additional_config.enable_fused_mc2 to 0."
             )
 
+        # Static/rotating expert split (prefill-oriented weight offload).
+        from vllm_ascend.expert_rotation.config import ExpertRotationConfig
+
+        self.expert_rotation_config = ExpertRotationConfig(
+            additional_config.get("expert_rotation_config", {}),
+        )
+        self._validate_expert_rotation_compatibility()
+
     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_c8:
             raise NotImplementedError(
@@ -884,6 +892,21 @@ class AscendConfig:
                 "cache. Disable enable_sparse_sfa_c8; enable_sparse_li_c8 is "
                 "supported because the indexer cache remains device-resident."
             )
+
+    def _validate_expert_rotation_compatibility(self) -> None:
+        if not self.expert_rotation_config.enabled:
+            return
+        problems = []
+        if self.eplb_config.dynamic_eplb:
+            problems.append("dynamic EPLB reassigns experts to slots at runtime, which breaks the fixed static/rotating split")
+        if self.enable_fused_mc2 == 1:
+            problems.append("enable_fused_mc2 fuses dispatch+MLP+combine into one operator and cannot split the MLP stage")
+        if problems:
+            raise ValueError(
+                "expert_rotation_config is incompatible with the current configuration: "
+                + "; ".join(problems)
+            )
+        self.expert_rotation_config.validate_against_vllm_config(self.vllm_config)
 
     @classmethod
     def _check_mooncake_c8_kv_cache_quant(cls, vllm_config: VllmConfig) -> None:

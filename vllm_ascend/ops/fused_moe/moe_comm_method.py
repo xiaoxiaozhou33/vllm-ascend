@@ -145,7 +145,24 @@ class MoECommMethod(ABC):
             token_dispatch_output=token_dispatch_output,
             moe_config=self.moe_config,
         )
-        if quant_method is None:
+        rotation_ctx = _EXTRA_CTX.rotation_ctx
+        if rotation_ctx is not None:
+            # Static/rotating expert split: run the MLP stage as two GMM calls
+            # around the static/rotating expert boundary (see
+            # vllm_ascend.expert_rotation.split_apply). The rotating call waits
+            # for this layer's slot H2D (copy stream) and re-marks the slot
+            # free for the next rotation.
+            from vllm_ascend.expert_rotation import rotation_split_apply
+
+            def _mlp_apply(x):
+                if quant_method is None:
+                    return self._apply_mlp(x)
+                return apply_moe_mlp(x, quant_method)
+
+            mlp_output, before_gmm2_evt = rotation_split_apply(
+                mlp_compute_input, rotation_ctx, _mlp_apply
+            )
+        elif quant_method is None:
             # Legacy path (310P): the comm method overrides ``_apply_mlp`` with
             # its own MLP implementation.
             mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
