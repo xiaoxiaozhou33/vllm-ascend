@@ -16,6 +16,7 @@
 #
 from __future__ import annotations
 
+from functools import wraps
 import torch
 import torch.nn.functional as F
 from vllm.distributed import (
@@ -151,6 +152,32 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     expert_ids_per_ep_rank,
                     persistent=False,
                 )
+
+        # Expert rotation (static/rotating split): register the layer and wrap
+        # process_weights_after_loading to split each layer's weights as soon
+        # as the quant method has produced the final device-format tensors.
+        # Lazy import: keeps the expert_rotation package out of the import
+        # critical path and avoids any early-import ordering surprises.
+        self.moe_instance_id = routed_experts.moe_instance_id
+        self._expert_rotation_manager = None
+        from vllm_ascend.expert_rotation import maybe_init_expert_rotation_manager
+
+        rotation_manager = maybe_init_expert_rotation_manager()
+        if rotation_manager is not None:
+            rotation_manager.register_runner(self)
+            self._expert_rotation_manager = rotation_manager
+            # routed_experts.forward_impl reads this to build the per-forward
+            # rotation ctx (slot bind + L+1 prefetch) before MoE dispatch.
+            routed_experts._expert_rotation_manager = rotation_manager
+            original_process_weights = self._quant_method.process_weights_after_loading
+
+            @wraps(original_process_weights)
+            def wrapped_rotation_split(*args, **kwargs):
+                result = original_process_weights(*args, **kwargs)
+                rotation_manager.split_layer(self)
+                return result
+
+            self._quant_method.process_weights_after_loading = wrapped_rotation_split  # type: ignore
 
     def forward(
         self,

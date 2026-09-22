@@ -1,3 +1,4 @@
+import os
 import math
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -391,6 +392,16 @@ def select_moe_comm_method(
     if not is_moe_model(vllm_config):
         return None
 
+    # Opt-in escape hatch: MC2 dispatch tiling caps expertIds dim1 (topk) well
+    # below 24 (561002 in dummy_run on TP4/EP4), so large-topk models cannot
+    # take the MC2 path. Force a method via VLLM_ASCEND_MOE_COMM_FORCE,
+    # overriding the hardware-policy selectors below.
+    forced = os.getenv("VLLM_ASCEND_MOE_COMM_FORCE")
+    if forced == "ALLGATHER":
+        return MoECommType.ALLGATHER
+    if forced == "MC2":
+        return MoECommType.MC2
+
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     moe_comm_policy = get_current_hardware_profile().moe_comm_policy
     lora_config = getattr(vllm_config, "lora_config", None)
@@ -453,6 +464,10 @@ class _ExtraForwardContextProxy:
         "padded_num_tokens",
         "sinks",
         "eplb_heat_collection_status",
+        # Expert rotation runtime context (vllm_ascend.expert_rotation); set by
+        # AscendMoERunner.no_shared_forward_impl around the quant apply call and
+        # consumed by MoECommMethod.fused_experts to split the MLP stage.
+        "rotation_ctx",
     )
 
     def check_extra_attr(self, name: str):

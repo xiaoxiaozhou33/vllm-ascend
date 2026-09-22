@@ -686,7 +686,18 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if lora_context is not None:
             sync_lora_context(self.quant_method, lora_context)
 
-        prepare_output = moe_comm_method.prepare(
+        # Expert rotation: bind this layer's rotating block to its slot and
+        # kick the L+1 prefetch before routing/dispatch, so the big-block H2D
+        # overlaps gate + dispatch + the static GMM segment. The ctx travels to
+        # MoECommMethod.fused_experts on _EXTRA_CTX (read within this call
+        # stack, cleared in the finally below).
+        rotation_ctx = None
+        rotation_manager = getattr(self, "_expert_rotation_manager", None)
+        if rotation_manager is not None:
+            rotation_ctx = rotation_manager.make_runtime_ctx(self.moe_instance_id)
+            _EXTRA_CTX.rotation_ctx = rotation_ctx
+
+        prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
             # The SP model wrapper already shards and gathers the MoE sequence.
@@ -720,6 +731,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         finally:
             self.ascend_pertoken_scale = None
             self.ascend_mc2_mask = None
+            if rotation_ctx is not None:
+                _EXTRA_CTX.rotation_ctx = None
 
         if self._use_v2_model_runner:
             _record_v2_eplb_load(self.router, fused_experts_results)
