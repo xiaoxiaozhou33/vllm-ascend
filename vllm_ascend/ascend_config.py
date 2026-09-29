@@ -613,6 +613,9 @@ class AscendConfig:
     ascend_fusion_config: AscendFusionConfig = dataclasses.field(default_factory=AscendFusionConfig)
     ascend_warmup_config: AscendWarmupConfig = dataclasses.field(default_factory=AscendWarmupConfig)
     eplb_config: EplbConfig = dataclasses.field(default_factory=EplbConfig)
+    # expert_rotation: raw dict accepted here (extra="forbid" gate);
+    # converted to ExpertRotationConfig in derive_and_validate.
+    expert_rotation_config: dict[str, Any] = dataclasses.field(default_factory=dict)
     rejection_sampler_config: RejectionSamplerConfig = dataclasses.field(default_factory=RejectionSamplerConfig)
     rl_config: RlConfig = dataclasses.field(default_factory=RlConfig)
 
@@ -934,6 +937,13 @@ class AscendConfig:
 
         # sparse KV offload vs packed SFA main cache mutex
         self._validate_sparse_packed_kv_offload_compatibility()
+        # Static/rotating expert split (prefill-oriented weight offload).
+        from vllm_ascend.expert_rotation.config import ExpertRotationConfig
+
+        self.expert_rotation_config = ExpertRotationConfig(
+            (vc.additional_config or {}).get("expert_rotation_config", {}),
+        )
+        self._validate_expert_rotation_compatibility(vc)
         return self
 
     @property
@@ -982,7 +992,7 @@ class AscendConfig:
                 "Sparse LI C8 is supported because the indexer cache remains device-resident."
             )
 
-    def _validate_expert_rotation_compatibility(self) -> None:
+    def _validate_expert_rotation_compatibility(self, vllm_config: VllmConfig) -> None:
         if not self.expert_rotation_config.enabled:
             return
         problems = []
@@ -995,7 +1005,7 @@ class AscendConfig:
                 "expert_rotation_config is incompatible with the current configuration: "
                 + "; ".join(problems)
             )
-        self.expert_rotation_config.validate_against_vllm_config(self.vllm_config)
+        self.expert_rotation_config.validate_against_vllm_config(vllm_config)
 
     @classmethod
     def _check_mooncake_c8_kv_cache_quant(cls, vllm_config: VllmConfig) -> None:
