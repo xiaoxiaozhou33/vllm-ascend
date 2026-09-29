@@ -515,6 +515,9 @@ class AscendConfig:
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)
     ascend_fusion_config: AscendFusionConfig = dataclasses.field(default_factory=AscendFusionConfig)
     eplb_config: EplbConfig = dataclasses.field(default_factory=EplbConfig)
+    # expert_rotation: raw dict accepted here (extra="forbid" gate);
+    # converted to ExpertRotationConfig in derive_and_validate.
+    expert_rotation_config: dict[str, Any] = dataclasses.field(default_factory=dict)
     rejection_sampler_config: RejectionSamplerConfig = dataclasses.field(default_factory=RejectionSamplerConfig)
     rl_config: RlConfig = dataclasses.field(default_factory=RlConfig)
 
@@ -843,6 +846,13 @@ class AscendConfig:
 
         # sparse KV offload vs sparse SFA C8 main cache mutex
         self._validate_sparse_c8_kv_offload_compatibility()
+        # Static/rotating expert split (prefill-oriented weight offload).
+        from vllm_ascend.expert_rotation.config import ExpertRotationConfig
+
+        self.expert_rotation_config = ExpertRotationConfig(
+            (vc.additional_config or {}).get("expert_rotation_config", {}),
+        )
+        self._validate_expert_rotation_compatibility(vc)
         return self
 
     def _validate_mc2_comm_alg(self, vllm_config: VllmConfig) -> None:
@@ -877,13 +887,6 @@ class AscendConfig:
                 "Please set additional_config.enable_fused_mc2 to 0."
             )
 
-        # Static/rotating expert split (prefill-oriented weight offload).
-        from vllm_ascend.expert_rotation.config import ExpertRotationConfig
-
-        self.expert_rotation_config = ExpertRotationConfig(
-            additional_config.get("expert_rotation_config", {}),
-        )
-        self._validate_expert_rotation_compatibility()
 
     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_c8:
@@ -893,7 +896,7 @@ class AscendConfig:
                 "supported because the indexer cache remains device-resident."
             )
 
-    def _validate_expert_rotation_compatibility(self) -> None:
+    def _validate_expert_rotation_compatibility(self, vllm_config: VllmConfig) -> None:
         if not self.expert_rotation_config.enabled:
             return
         problems = []
@@ -906,7 +909,7 @@ class AscendConfig:
                 "expert_rotation_config is incompatible with the current configuration: "
                 + "; ".join(problems)
             )
-        self.expert_rotation_config.validate_against_vllm_config(self.vllm_config)
+        self.expert_rotation_config.validate_against_vllm_config(vllm_config)
 
     @classmethod
     def _check_mooncake_c8_kv_cache_quant(cls, vllm_config: VllmConfig) -> None:
