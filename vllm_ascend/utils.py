@@ -927,9 +927,20 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
             }
         )
     else:
-        from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+        try:
+            from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+        except ImportError:
+            # fla_npu (flash-linear-attention-npu) is only needed by GDN-family
+            # linear-attention models; skip the op registration instead of
+            # failing worker startup for deployments that never touch them.
+            from vllm.logger import logger
 
-        REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] = AscendGatedDeltaNetAttention
+            logger.warning(
+                "GatedDeltaNetAttention op unavailable (fla_npu missing); "
+                "GDN-family linear-attention models unsupported here"
+            )
+        else:
+            REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] = AscendGatedDeltaNetAttention
 
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)

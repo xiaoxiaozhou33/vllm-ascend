@@ -36,7 +36,15 @@ import vllm_ascend.patch.worker.patch_bind_kv_cache  # noqa
 import vllm_ascend.patch.worker.patch_step3p5  # noqa
 
 if get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
-    import vllm_ascend.patch.worker.patch_qwen3_5  # noqa
+    try:
+        import vllm_ascend.patch.worker.patch_qwen3_5  # noqa
+    except ImportError as _e:
+        # patch_qwen3_5 backs Qwen3.5 GDN layers and pulls fla_npu
+        # (flash-linear-attention-npu). Deployments without that package never
+        # run GDN models; skip the patch instead of failing worker startup.
+        from vllm.logger import logger as _logger
+
+        _logger.warning("patch_qwen3_5 unavailable (%s); Qwen3.5 GDN models unsupported here", _e)
     import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa
     import vllm_ascend.patch.worker.patch_qwen3vl  # noqa
 else:

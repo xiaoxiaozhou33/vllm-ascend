@@ -10,8 +10,15 @@ from vllm_ascend.ops.causal_conv1d import (
     causal_conv1d_fn as _npu_causal_conv1d_fn_impl,
 )
 from vllm_ascend.ops.causal_conv1d import causal_conv1d_update as _npu_causal_conv1d_update_impl
-from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.layernorm_guard import LayerNormFn
+
+try:
+    from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
+except ImportError:
+    # fla_npu (flash-linear-attention-npu) only backs GDN/KDA-family
+    # linear-attention models. Without it, keep the stock FLA ops instead
+    # of failing worker startup for deployments that never touch them.
+    chunk_gated_delta_rule = None
 
 triton.next_power_of_2 = next_power_of_2
 
@@ -58,7 +65,8 @@ _cc1d.causal_conv1d_update = _npu_causal_conv1d_update
 _cc1d.causal_conv1d_fn = _npu_causal_conv1d_fn
 
 fla_layernorm_guard.LayerNormFn = LayerNormFn
-fla_ops.chunk_gated_delta_rule = chunk_gated_delta_rule
+if chunk_gated_delta_rule is not None:
+    fla_ops.chunk_gated_delta_rule = chunk_gated_delta_rule
 
 # GLM-5.3-Flash (and Kimi KDA) import fused_recurrent_kda / chunk_kda_with_fused_gate
 # from this FLA module. Swap them for the NPU Triton implementations before the
