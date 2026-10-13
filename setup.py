@@ -40,7 +40,7 @@ def load_module_from_path(module_name, path):
     return module
 
 
-ROOT_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 logger = logging.getLogger(__name__)
 
 
@@ -411,7 +411,7 @@ class custom_install(install):
         install.run(self)
 
 
-ROOT_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 try:
     VERSION = get_version(write_to="vllm_ascend/_version.py")
 except LookupError:
