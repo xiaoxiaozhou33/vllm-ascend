@@ -39,6 +39,7 @@ metadata) stay untouched - no partial sums, no renormalize bookkeeping.
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import Callable
 
@@ -55,12 +56,121 @@ def _slice_from(t: torch.Tensor | None, n: int) -> torch.Tensor | None:
     return None if t is None else t[n:]
 
 
+def _merged_gmm_apply(mlp_compute_input, ctx, apply_mlp: Callable):
+    """Run the MLP stage as ONE GMM per weight matrix over all routed rows.
+
+    Merged mode (VLLM_ASCEND_ER_MERGED_GMM=1): the manager's fill gathers the
+    static experts into the combined slot's prefix via D2D (resident weights,
+    HBM engine) while the rotating suffix arrives via H2D (pinned, PCIe/SDMA)
+    — the two engines overlap, so the combined slot costs the same wall time
+    as the rotating-only fill. With the full S+R expert set contiguous in the
+    slot, a single apply_mlp serves the whole sorted row range, giving
+    downstream optimized kernels contiguous weight inputs.
+
+    ``apply_mlp`` is ``MoECommMethod._apply_mlp`` (returns ``(output, event)``).
+    """
+    gl = mlp_compute_input.group_list
+    glt = mlp_compute_input.group_list_type
+    x = mlp_compute_input.hidden_states
+    total_rows = x.shape[0]
+    off = getattr(ctx, "row_offset", 0) or 0
+    own = getattr(ctx, "own_rows", None)
+
+    if glt == 1:  # per-expert counts (local)
+        n_total = int(gl.sum().item())
+        full_gl = gl
+    elif glt == 0:  # prefix sums; positions are GLOBAL when off > 0
+        g_e = int(gl[-1].item())
+        n_total = g_e - off
+        full_gl = gl - off
+        if own is not None and n_total > own:
+            raise RuntimeError(
+                f"[expert_rotation] own block mismatch: gl_end-off={n_total} own={own}"
+            )
+    else:
+        raise NotImplementedError(f"expert rotation does not support group_list_type={glt}")
+
+    if n_total < 0 or n_total > total_rows:
+        raise RuntimeError(
+            f"[expert_rotation] invalid merged boundary n_total={n_total} (rows={total_rows})"
+        )
+
+    def _slice(rows_lo: int, rows_hi: int, group_list: torch.Tensor, weights):
+        def _rows(t):
+            return None if t is None else t[rows_lo:rows_hi].contiguous()
+
+        return replace(
+            mlp_compute_input,
+            hidden_states=x[rows_lo:rows_hi].contiguous(),
+            group_list=group_list.contiguous(),
+            dynamic_scale=_rows(mlp_compute_input.dynamic_scale),
+            topk_scales=_rows(mlp_compute_input.topk_scales),
+            weights=weights,
+            lora_context=None,
+            expanded_row_idx=None,
+            topk_ids=None,
+        )
+
+    ctx.manager.wait_slot_ready(ctx)
+    combined_weights = ctx.manager.build_rot_weights(mlp_compute_input.weights, ctx.slot_idx)
+    # The quant gmm hooks (w4a8/w8a8 apply_gmm*) read weights from the LAYER
+    # module, not from the MoEWeights payload that build_rot_weights just
+    # swapped — rebind the layer attrs to this slot's combined (S+R) views for
+    # the single call, or the GMM silently runs against the static (shrunk)
+    # weights; shape checks only fire when the dims disagree, S == R configs
+    # compute wrong values instead of raising (same hazard as the split path).
+    _layer = mlp_compute_input.layer
+    _swapped = []
+    if _layer is not None:
+        from vllm_ascend.expert_rotation.weight_layout import _ROLE_SPECS
+
+        _qt = mlp_compute_input.quant.quant_type
+        for _role, _views in ctx.manager.slot_views.items():
+            _spec = _ROLE_SPECS.get((_qt, _role))
+            if _spec is None:
+                continue
+            _attr = next(
+                (a for a in _spec.attrs if getattr(_layer, a, None) is not None),
+                None,
+            )
+            if _attr is None:
+                continue
+            _swapped.append((_attr, getattr(_layer, _attr)))
+            # bypass nn.Module.__setattr__ (registered Parameters reject plain
+            # tensors); the instance __dict__ write shadows for getattr reads.
+            object.__setattr__(_layer, _attr, _views[ctx.slot_idx])
+    try:
+        out, evt = apply_mlp(_slice(off, off + n_total, full_gl, combined_weights))
+    finally:
+        for _attr, _saved in _swapped:
+            object.__setattr__(_layer, _attr, _saved)
+    ctx.manager.mark_slot_consumed(ctx)
+
+    if os.getenv("VLLM_ASCEND_ER_HASH"):
+        with torch.no_grad():
+            m32 = out.float()
+        with open("/tmp/er_hash.log", "a") as _f:
+            _f.write(
+                f"MERGED r={os.getpid()} epr={getattr(ctx, 'ep_rank', -1)} mid={ctx.moe_instance_id} rows={out.shape[0]} "
+                f"msum={m32.sum().item():.4e} mabs={m32.abs().sum().item():.4e}\n"
+            )
+
+    if off == 0 and out.shape[0] == total_rows:
+        return out, evt
+    # global-layout mode: reassemble into a full-size buffer at the own offsets
+    out_full = torch.zeros((total_rows,) + tuple(x.shape[1:]), dtype=out.dtype, device=x.device)
+    out_full[off : off + n_total] = out
+    return out_full, evt
+
+
 def rotation_split_apply(mlp_compute_input, ctx, apply_mlp: Callable):
     """Run the MLP stage as static + rotating GMM calls.
 
     ``apply_mlp`` is ``MoECommMethod._apply_mlp`` (returns ``(output, event)``).
     ``ctx`` is the :class:`RotationCtx` stashed on ``_EXTRA_CTX``.
     """
+    if ctx.manager.merged_gmm and not os.getenv("VLLM_ASCEND_ER_NO_SHRINK"):
+        return _merged_gmm_apply(mlp_compute_input, ctx, apply_mlp)
     S = ctx.num_static
     gl = mlp_compute_input.group_list
     glt = mlp_compute_input.group_list_type
@@ -194,7 +304,42 @@ def rotation_split_apply(mlp_compute_input, ctx, apply_mlp: Callable):
         else:
             ctx.manager.wait_slot_ready(ctx)
             rot_weights = ctx.manager.build_rot_weights(mlp_compute_input.weights, ctx.slot_idx)
-            out_r, _ = apply_mlp(_mlp_slice(off + n_s, off + n_s + n_rot, rot_gl, weights=rot_weights))
+            # The quant gmm hooks (w4a8/w8a8 apply_gmm*) read weights from the
+            # LAYER module (mlp_compute_input.layer.w13_weight ...), not from
+            # the MoEWeights payload that build_rot_weights just swapped —
+            # rebind the layer attrs to this slot's views for the rotating
+            # call, or the GMM silently runs against the static (shrunk)
+            # weights. The mismatch is shape-checked by aclnn only when
+            # S != R (groupList len R vs weight dim0 S); S == R configs
+            # compute wrong values instead of raising.
+            _layer = mlp_compute_input.layer
+            _swapped = []
+            if _layer is not None:
+                from vllm_ascend.expert_rotation.weight_layout import _ROLE_SPECS
+
+                _qt = mlp_compute_input.quant.quant_type
+                for _role, _views in ctx.manager.slot_views.items():
+                    _spec = _ROLE_SPECS.get((_qt, _role))
+                    if _spec is None:
+                        continue
+                    _attr = next(
+                        (a for a in _spec.attrs if getattr(_layer, a, None) is not None),
+                        None,
+                    )
+                    if _attr is None:
+                        continue
+                    _swapped.append((_attr, getattr(_layer, _attr)))
+                    # bypass nn.Module.__setattr__: these attrs are registered
+                    # Parameters and a plain slot-view tensor would be rejected
+                    # ("torch.nn.Parameter or None expected"); a direct instance
+                    # __dict__ write shadows the registration for the getattr
+                    # reads in the gmm hooks.
+                    object.__setattr__(_layer, _attr, _views[ctx.slot_idx])
+            try:
+                out_r, _ = apply_mlp(_mlp_slice(off + n_s, off + n_s + n_rot, rot_gl, weights=rot_weights))
+            finally:
+                for _attr, _saved in _swapped:
+                    object.__setattr__(_layer, _attr, _saved)
             ctx.manager.mark_slot_consumed(ctx)
         if out_r.shape[0] != n_rot:
             raise RuntimeError(

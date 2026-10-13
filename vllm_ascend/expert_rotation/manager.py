@@ -55,9 +55,11 @@ import torch
 
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.expert_rotation.config import ExpertRotationConfig
 from vllm_ascend.expert_rotation.weight_layout import (
     RotatingComponent,
+    bytes_per_expert,
     copy_storage_slice,
     split_layer_weights,
     supported_quant_type,
@@ -74,6 +76,9 @@ class LayerRotationState:
     num_rotating: int
     components: dict[str, RotatingComponent]
     pinned_bytes: int = 0
+    # merged-GMM mode: resident static weights per role (device tensors, the
+    # D2D source for the combined slot's prefix)
+    static_srcs: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass
@@ -94,6 +99,7 @@ class _SlotState:
     holder: int | None = None  # moe_instance_id whose block is loaded/loading
     copy_done: torch.npu.Event = field(default_factory=torch.npu.Event)
     slot_free: torch.npu.Event = field(default_factory=torch.npu.Event)
+    d2d_done: torch.npu.Event = field(default_factory=torch.npu.Event)
 
 
 class ExpertRotationManager:
@@ -102,6 +108,9 @@ class ExpertRotationManager:
     def __init__(self, config: ExpertRotationConfig):
         self.config = config
         self.num_slots = config.num_slots
+        # merged-GMM mode: static (D2D) + rotating (H2D) experts gathered into
+        # one combined S+R slot, single GMM per weight matrix at run time.
+        self.merged_gmm = envs.VLLM_ASCEND_ER_MERGED_GMM
         self.layers: dict[int, LayerRotationState] = {}
         # pre-sized mode: per-layer staging module + static->staging param map
         self._staging_modules: dict[int, torch.nn.Module] = {}
@@ -111,6 +120,12 @@ class ExpertRotationManager:
         self.slot_views: dict[str, list[torch.Tensor]] = {}
         self.slot_states: list[_SlotState] = [_SlotState() for _ in range(self.num_slots)]
         self.copy_stream = torch.npu.Stream() if config.prefetch_enabled else None
+        # D2D gather stream for the merged mode's static prefix; runs the
+        # device-side copy in parallel with the copy stream's H2D suffix fill
+        # (different engines: HBM/vector vs PCIe/SDMA).
+        self.d2d_stream = (
+            torch.npu.Stream() if (config.prefetch_enabled and self.merged_gmm) else None
+        )
         self._last_served: int | None = None
         self._registered = 0
         self._pinned_bytes_total = 0
@@ -118,9 +133,10 @@ class ExpertRotationManager:
         for s in self.slot_states:
             s.slot_free.record()
         logger.info(
-            "[expert_rotation] manager created: num_slots=%d prefetch=%s",
+            "[expert_rotation] manager created: num_slots=%d prefetch=%s merged_gmm=%s",
             self.num_slots,
             config.prefetch_enabled,
+            self.merged_gmm,
         )
 
     # ------------------------------------------------------------------
@@ -166,14 +182,29 @@ class ExpertRotationManager:
         orig_wl = re.weight_loader
 
         # global -> local map (forward) and local -> global (reverse), built
-        # once from the runner's expert map (tensor of shape [E_global]).
-        emap = getattr(runner, "_expert_map", None)
-        if emap is None:
+        # once from the routed_experts module's OWN map — the exact map
+        # orig_wl applies internally (expert_map_manager), so the rev[]
+        # lookup in _rotation_weight_loader stays its precise inverse.
+        # Identity is only valid when experts are not EP-sharded; under
+        # DP+EP a runner-level mirror attr may be absent, and an identity
+        # fallback would mis-route foreign experts into staging (OOB on the
+        # start=0 rank, silent skip/wrong-rows on the others).
+        n_global = runner.moe_config.num_experts
+        if runner.moe_config.num_local_experts == n_global:
             # ep_size == 1: identity mapping over the full expert set
-            n_global = runner.moe_config.num_experts
             fwd = list(range(n_global))
         else:
-            fwd = emap.cpu().tolist()
+            map_fn = getattr(
+                re, "_map_global_expert_id_to_local_expert_id", None
+            )
+            if map_fn is None:
+                raise RuntimeError(
+                    "[expert_rotation] EP sharding active (num_local_experts="
+                    f"{runner.moe_config.num_local_experts} < {n_global}) but "
+                    "routed_experts exposes no global->local expert map; "
+                    "refusing identity fallback"
+                )
+            fwd = [int(map_fn(g)) for g in range(n_global)]
         rev = {}
         for g, l in enumerate(fwd):
             if l >= 0 and l not in rev:
@@ -256,6 +287,30 @@ class ExpertRotationManager:
     def _static_size(self, runner) -> int:
         return runner.moe_config.num_local_experts - self.config.num_rotating_experts
 
+    @staticmethod
+    def _collect_static_srcs(layer: torch.nn.Module, quant_type) -> dict[str, torch.Tensor]:
+        """Snapshot the resident (shrunk) static tensors per role after the split.
+
+        Merged-GMM mode uses them as the D2D source filling the combined slot's
+        static prefix at every rotation fill. Must run AFTER the layer attrs
+        have been shrunk/replaced (split_layer_weights or the pre-sized
+        transform), so the references are to the final S-row device tensors.
+        """
+        from vllm_ascend.expert_rotation.weight_layout import _ROLE_SPECS
+
+        srcs: dict[str, torch.Tensor] = {}
+        for (qt, role), spec in _ROLE_SPECS.items():
+            if qt != quant_type:
+                continue
+            attr = next((a for a in spec.attrs if getattr(layer, a, None) is not None), None)
+            if attr is None:
+                continue
+            t = getattr(layer, attr)
+            if isinstance(t, torch.nn.Parameter):
+                t = t.data
+            srcs[role] = t
+        return srcs
+
     def _mark_layer(self, runner, state: "LayerRotationState") -> None:
         """Stamp the FULL logical local expert count (static + rotating) on the
         routed-experts layer object. Routing/dispatch must cover all experts
@@ -275,14 +330,15 @@ class ExpertRotationManager:
         if self.config.pre_sized and mid in self._staging_modules:
             self._split_pre_sized(runner, mid, num_rotating, first)
             return
+        num_local = runner.moe_config.num_local_experts
         components = split_layer_weights(
             layer,
             runner.quant_type,
             num_rotating,
             num_slots=self.num_slots if first else 0,
+            slot_capacity=(num_local if self.merged_gmm else None),
             verify=self.config.verify_split,
         )
-        num_local = runner.moe_config.num_local_experts
         state = LayerRotationState(
             moe_instance_id=mid,
             num_local_experts=num_local,
@@ -290,6 +346,7 @@ class ExpertRotationManager:
             num_rotating=num_rotating,
             components=components,
             pinned_bytes=sum(c.nbytes for c in components.values()),
+            static_srcs=self._collect_static_srcs(layer, runner.quant_type),
         )
         self.layers[mid] = state
         self._mark_layer(runner, state)
@@ -369,9 +426,14 @@ class ExpertRotationManager:
                 )
             nz = is_nz_tensor(t)
             pinned = absorb_suffix_to_pinned(t, num_rotating)
+            # merged mode: slot holds the combined S+R rows (static prefix +
+            # rotating suffix); the staging tensor is only a shape/format
+            # template for the rebuild, so S+R rows is fine even though the
+            # staging module itself carries just R.
+            slot_rows = runner.moe_config.num_local_experts if self.merged_gmm else num_rotating
             slots = [
                 _rebuild_expert_rows(
-                    t, num_rotating, nz=nz, transposed_view=spec.transposed_view, quant_type=quant_type
+                    t, slot_rows, nz=nz, transposed_view=spec.transposed_view, quant_type=quant_type
                 )
                 for _ in range(self.num_slots if first else 0)
             ]
@@ -386,6 +448,7 @@ class ExpertRotationManager:
             num_rotating=num_rotating,
             components=components,
             pinned_bytes=sum(c.nbytes for c in components.values()),
+            static_srcs=self._collect_static_srcs(runner.routed_experts, quant_type),
         )
         self.layers[mid] = state
         self._mark_layer(runner, state)
@@ -481,30 +544,93 @@ class ExpertRotationManager:
         )
 
     def _fill_slot(self, moe_instance_id: int, slot_idx: int) -> None:
-        """Load layer ``moe_instance_id``'s rotating block into slot ``slot_idx``.
+        """Load layer ``moe_instance_id``'s expert block into slot ``slot_idx``.
 
-        Prefetch mode: big-block H2D on the copy stream, waiting for the slot's
-        previous consumer to finish reading (slot_free). Sync mode: the copy is
-        enqueued on the compute stream itself, so the layer's own kernels are
-        naturally ordered after it.
+        Split mode: big-block H2D of the R rotating experts on the copy stream.
+        Merged mode: the slot is the combined S+R buffer — the rotating suffix
+        is H2D-filled from pinned on the copy stream WHILE the static prefix is
+        D2D-gathered from the resident weights on the d2d stream (PCIe/SDMA and
+        HBM/vector are distinct engines, so the two fills overlap; the D2D at
+        ~670GB/s hides completely under the ~53GB/s H2D). copy_done fires only
+        after both engines finish.
+
+        Both modes wait for the slot's previous consumer (slot_free). Sync mode
+        (prefetch disabled) enqueues on the compute stream itself, so the
+        layer's own kernels are naturally ordered after the fill.
         """
         state = self.layers[moe_instance_id]
         slot = self.slot_states[slot_idx]
         if self.copy_stream is not None:
-            with torch.npu.stream(self.copy_stream):
-                self.copy_stream.wait_event(slot.slot_free)
-                for comp in state.components.values():
-                    copy_storage_slice(
-                        self.slot_views[comp.role][slot_idx], comp.pinned.untyped_storage(), non_blocking=True
-                    )
+            if not self.merged_gmm:
+                with torch.npu.stream(self.copy_stream):
+                    self.copy_stream.wait_event(slot.slot_free)
+                    for comp in state.components.values():
+                        copy_storage_slice(
+                            self.slot_views[comp.role][slot_idx],
+                            comp.pinned.untyped_storage(),
+                            non_blocking=True,
+                        )
+                    slot.copy_done.record(self.copy_stream)
+            else:
+                num_static, num_rotating = state.num_static, state.num_rotating
+                with torch.npu.stream(self.copy_stream):
+                    self.copy_stream.wait_event(slot.slot_free)
+                    for comp in state.components.values():
+                        slot_t = self.slot_views[comp.role][slot_idx]
+                        per_e = bytes_per_expert(slot_t)
+                        # rotating suffix: pinned H2D
+                        copy_storage_slice(
+                            slot_t,
+                            comp.pinned.untyped_storage(),
+                            non_blocking=True,
+                            dst_offset=num_static * per_e,
+                            nbytes=num_rotating * per_e,
+                        )
+                with torch.npu.stream(self.d2d_stream):
+                    self.d2d_stream.wait_event(slot.slot_free)
+                    for comp in state.components.values():
+                        slot_t = self.slot_views[comp.role][slot_idx]
+                        static_src = state.static_srcs[comp.role]
+                        per_e = bytes_per_expert(slot_t)
+                        # static prefix: resident D2D gather (src MUST be a
+                        # storage slice: whole-storage NPU sources keep the
+                        # internal-format tag and the copy raises)
+                        copy_storage_slice(
+                            slot_t,
+                            static_src.untyped_storage(),
+                            non_blocking=True,
+                            dst_offset=0,
+                            nbytes=num_static * per_e,
+                        )
+                    slot.d2d_done.record(self.d2d_stream)
+                self.copy_stream.wait_event(slot.d2d_done)
                 slot.copy_done.record(self.copy_stream)
         else:
             cur = torch.npu.current_stream()
             cur.wait_event(slot.slot_free)
             for comp in state.components.values():
-                copy_storage_slice(
-                    self.slot_views[comp.role][slot_idx], comp.pinned.untyped_storage(), non_blocking=True
-                )
+                slot_t = self.slot_views[comp.role][slot_idx]
+                if self.merged_gmm:
+                    num_static = state.num_static
+                    per_e = bytes_per_expert(slot_t)
+                    copy_storage_slice(
+                        slot_t,
+                        state.static_srcs[comp.role].untyped_storage(),
+                        non_blocking=True,
+                        dst_offset=0,
+                        nbytes=num_static * per_e,
+                    )
+                    copy_storage_slice(
+                        slot_t,
+                        comp.pinned.untyped_storage(),
+                        non_blocking=True,
+                        dst_offset=num_static * per_e,
+                        nbytes=state.num_rotating * per_e,
+                    )
+                else:
+                    copy_storage_slice(
+                        slot_t, comp.pinned.untyped_storage(), non_blocking=True
+                    )
             slot.copy_done.record(cur)
         slot.holder = moe_instance_id
 

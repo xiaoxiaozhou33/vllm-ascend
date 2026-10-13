@@ -87,6 +87,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Expert rotation: gather static (D2D) + rotating (H2D) experts into one
+    # combined slot and run a single GMM per weight matrix, instead of the
+    # static/rotating two-segment GMM pair. "1" (default): merged single GMM.
+    # "0": legacy two-GMM split. This configuration is not sensitive.
+    "VLLM_ASCEND_ER_MERGED_GMM": lambda: _strict_binary_env("VLLM_ASCEND_ER_MERGED_GMM", "1"),
 }
 
 # end-env-vars-definition

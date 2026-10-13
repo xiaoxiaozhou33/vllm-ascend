@@ -81,17 +81,35 @@ def bytes_per_expert(t: torch.Tensor) -> int:
     return total // num_experts
 
 
-def copy_storage_slice(dst: torch.Tensor, src_storage: torch.UntypedStorage, non_blocking: bool = False) -> None:
-    """Byte-level copy of ``src_storage`` into ``dst``'s storage (format-agnostic).
+def copy_storage_slice(
+    dst: torch.Tensor,
+    src_storage: torch.UntypedStorage,
+    non_blocking: bool = False,
+    *,
+    dst_offset: int = 0,
+    src_offset: int = 0,
+    nbytes: int | None = None,
+) -> None:
+    """Byte-level copy of a ``src_storage`` region into ``dst``'s storage (format-agnostic).
 
-    The destination is addressed as a storage SLICE (``[0:nbytes]``): slicing
-    detaches the slice from the allocation's internal-format tag, which makes
-    torch_npu degrade the copy to a plain aclrtMemcpy instead of the aclnn
-    format-aware operator that rejects internal formats. Copying against the
-    whole storage object of an NZ tensor raises
-    ``copy_ do not support internal format`` on strict torch_npu builds.
+    Both sides are addressed as storage SLICES: slicing detaches them from the
+    allocation's internal-format tag, which makes torch_npu degrade the copy to
+    a plain aclrtMemcpy instead of the aclnn format-aware operator that rejects
+    internal formats. On aclnn-only device generations the rule is stricter
+    still: a device-side source passed as the WHOLE storage object keeps the
+    format tag and the copy raises, so a src slice (even ``[0:n]``) is required
+    for NPU->NPU copies too — the slice form is therefore used universally
+    here, for H2D, D2H and D2D alike.
+
+    ``dst_offset``/``src_offset``/``nbytes`` address sub-regions of the two
+    storages (e.g. the static prefix and the rotating suffix of a combined
+    rotation slot).
     """
-    dst.untyped_storage()[0 : src_storage.nbytes()].copy_(src_storage, non_blocking=non_blocking)
+    if nbytes is None:
+        nbytes = src_storage.nbytes() - src_offset
+    dst.untyped_storage()[dst_offset : dst_offset + nbytes].copy_(
+        src_storage[src_offset : src_offset + nbytes], non_blocking=non_blocking
+    )
 
 
 def absorb_suffix_to_pinned(t: torch.Tensor, num_rotating: int) -> torch.Tensor:
@@ -157,9 +175,14 @@ def _rebuild_expert_rows(
         # NPU->NPU storage copy_ still trips the aclnn internal-format check on
         # this device generation, so the D2D prefix copy is staged through
         # pinned host memory (D2H + H2D both bypass the check). Load-time only.
+        # When num_rows exceeds the template's own rows (merged-GMM combined
+        # slots: an R-row staging template sizing an S+R slot), only the
+        # template's bytes are staged; the tail rows are don't-care because
+        # every fill overwrites the whole slot.
         nbytes = num_rows * per_e
+        copy_bytes = min(nbytes, t.untyped_storage().nbytes())
         staging = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-        staging.untyped_storage().copy_(t.untyped_storage()[:nbytes])
+        staging.untyped_storage()[0:copy_bytes].copy_(t.untyped_storage()[0:copy_bytes])
         copy_storage_slice(new, staging.untyped_storage())
         del staging
         if transposed_view:
@@ -168,7 +191,15 @@ def _rebuild_expert_rows(
     # ND dense path
     if not t.is_contiguous():
         t = t.contiguous()
-    return t[:num_rows].clone()
+    if num_rows <= t.shape[0]:
+        return t[:num_rows].clone()
+    # Over-sized rebuild (merged-GMM combined slot from an R-row template):
+    # allocate num_rows and fill the prefix with the template's rows; the tail
+    # rows are don't-care because every fill overwrites the whole slot. A bare
+    # t[:num_rows] would silently clamp back to R rows here.
+    new = torch.empty((num_rows,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
+    new[: t.shape[0]].copy_(t)
+    return new
 
 
 @dataclass
@@ -218,6 +249,7 @@ def split_layer_weights(
     num_rotating: int,
     *,
     num_slots: int = 0,
+    slot_capacity: int | None = None,
     verify: bool = False,
 ) -> dict[str, RotatingComponent]:
     """Split one MoE layer's weights into a static prefix + rotating suffix.
@@ -275,8 +307,12 @@ def split_layer_weights(
         # Slots are shared across ALL layers (same R, same shapes); only the first
         # split layer allocates them. Slot contents are don't-care (overwritten by
         # the first fill); only the allocation + cast + view recipe matters.
+        # ``slot_capacity`` grows the slot to S+R rows for the merged-GMM mode,
+        # where the static experts are D2D-gathered into the slot prefix next to
+        # the H2D-filled rotating suffix.
+        slot_rows = num_rotating if slot_capacity is None else slot_capacity
         slots = [
-            _rebuild_expert_rows(t, num_rotating, nz=nz, transposed_view=spec.transposed_view, quant_type=quant_type)
+            _rebuild_expert_rows(t, slot_rows, nz=nz, transposed_view=spec.transposed_view, quant_type=quant_type)
             for _ in range(num_slots)
         ]
         import os as _os2
