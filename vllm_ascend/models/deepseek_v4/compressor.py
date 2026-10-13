@@ -108,7 +108,7 @@ class Compressor(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+        from vllm_ascend.models.layer.attention.layer import dsv4_block_entry as _dsv4_entry
 
         self.vllm_config = vllm_config
         self.config = config
@@ -159,7 +159,7 @@ class Compressor(nn.Module):
                 dtype=state_dtype,
                 compress_ratio=compress_ratio,
                 prefix=f"{prefix}.state_cache",
-                block_size=DSV4_BLOCK_SIZES[cache_config.block_size][0][2],
+                block_size=_dsv4_entry(cache_config.block_size)[0][2],
             )
         elif compress_ratio == 128:
             self.state_cache = AscendCompressorStateCache(
@@ -167,7 +167,7 @@ class Compressor(nn.Module):
                 dtype=state_dtype,
                 compress_ratio=compress_ratio,
                 prefix=f"{prefix}.state_cache",
-                block_size=DSV4_BLOCK_SIZES[cache_config.block_size][0][3],
+                block_size=_dsv4_entry(cache_config.block_size)[0][3],
             )
         else:
             raise ValueError(

@@ -108,9 +108,9 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
-        from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+        from vllm_ascend.models.layer.attention.layer import dsv4_block_entry as _dsv4_entry
 
-        storage_block_size = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0]
+        storage_block_size = _dsv4_entry(vllm_config.cache_config.block_size)[0][0]
         # vLLM #51718 replaced MLAAttentionSpec.compress_ratio with
         # AttentionSpec.tokens_per_state on main.
         ratio_kwargs = {"tokens_per_state": self.compress_ratio}

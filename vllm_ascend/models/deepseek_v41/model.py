@@ -553,9 +553,9 @@ class AscendDeepseekV41SWACache(DeepseekV41CacheLayer):
     """Ascend SWA cache registered with the V4.1 allocator."""
 
     def __init__(self, head_dim, window_size, dtype, prefix, cache_config):
-        from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+        from vllm_ascend.models.layer.attention.layer import dsv4_block_entry as _dsv4_entry
 
-        block_size = DSV4_BLOCK_SIZES[cache_config.block_size][0][1]
+        block_size = _dsv4_entry(cache_config.block_size)[0][1]
         spec = AscendSlidingWindowMLASpec(
             block_size=block_size,
             num_kv_heads=1,

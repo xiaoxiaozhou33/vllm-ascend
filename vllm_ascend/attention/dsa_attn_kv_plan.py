@@ -6,9 +6,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import os
+
 import torch
 import torch_npu
 from vllm.triton_utils import tl, triton
+from vllm.logger import logger
 
 from vllm_ascend.attention.mixed_quant_sparse_flash_mla import (
     mixed_quant_sparse_flash_mla,
@@ -144,7 +147,26 @@ class DsaAttnKvPlan:
     applies_sparse_attn_runtime_kwargs: bool
 
     def get_dsa_sparse_attn_metadata_op(self):
-        return self.sparse_attn_metadata_op
+        op = self.sparse_attn_metadata_op
+        if os.getenv("VLLM_ASCEND_DEBUG_ATTN_KWARGS") and not globals().get("_MD_KWARGS_PROBED", False):
+
+            def _md_probe(*args, **kwargs):
+                def render(v):
+                    if isinstance(v, torch.Tensor):
+                        vals = v.detach().cpu().tolist() if v.numel() <= 48 else "..."
+                        return f"Tensor{tuple(v.shape)}:{v.dtype}:{vals}"
+                    return repr(v)
+
+                globals()["_MD_KWARGS_PROBED"] = True
+                logger.warning(
+                    "[attn_md_kwargs] op=%s %s",
+                    getattr(op, "__name__", repr(op)),
+                    " ".join(f"{k}={render(v)}" for k, v in kwargs.items()),
+                )
+                return op(*args, **kwargs)
+
+            return _md_probe
+        return op
 
     def get_dsa_sparse_attn_metadata_kwargs(self, device) -> dict[str, Any]:
         kwargs = dict(self.sparse_attn_metadata_kwargs)
@@ -180,6 +202,20 @@ class DsaAttnKvPlan:
         if self.uses_sparse_flash_mla:
             if slot_mapping.ndim != 1:
                 raise ValueError(f"BF16 DSA slot_mapping must be [num_tokens], got {tuple(slot_mapping.shape)}.")
+            if cache.dim() == 4 and cache.shape[2] == 1 and cache.stride(-1) == 1 and not cache.is_contiguous():
+                # Padded pages (hybrid planner common_page_size): flatten would
+                # silently materialize a copy and the scatter below would write
+                # to it. Route through the stride-aware 2-level scatter shared
+                # with the epilog branch instead. [-1, -1] rows are skipped.
+                page = cache.shape[1]
+                valid = slot_mapping >= 0
+                skip = torch.full_like(slot_mapping, -1)
+                blocks = torch.where(valid, torch.div(slot_mapping, page, rounding_mode="floor"), skip)
+                offsets = torch.where(valid, slot_mapping % page, skip)
+                indices = torch.stack([blocks, offsets], dim=-1).to(torch.int32)
+                updates = x.view(x.shape[0], -1).to(cache.dtype).contiguous()
+                torch_npu.npu_scatter_nd_update_(cache.squeeze(-2), indices, updates)
+                return
             # Flatten the paged cache and keep a static [T, 1] index tensor so
             # ACLGraph capture matches the A5 FP8 / SFA one-dimensional slot
             # convention. Do not clamp PAD_SLOT_ID (-1) to 0: that overwrites
@@ -191,6 +227,89 @@ class DsaAttnKvPlan:
             return
         if not self.uses_kv_compress_epilog:
             torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, slot_mapping, x)
+            return
+        if os.getenv("VLLM_ASCEND_DEBUG_KV_GEOM"):
+            # First-call geometry probe for the view-size wall: shape/stride of
+            # the per-layer cache handed to the epilog scatter.
+            if not getattr(DsaAttnKvPlan.dsa_kv_compress_scatter, "_probed", False):
+                DsaAttnKvPlan.dsa_kv_compress_scatter._probed = True
+                logger.warning(
+                    "[kv_scatter] cache shape=%s stride=%s dtype=%s contig=%s "
+                    "x shape=%s slot shape=%s",
+                    tuple(cache.shape),
+                    tuple(cache.stride()),
+                    cache.dtype,
+                    cache.is_contiguous(),
+                    tuple(x.shape),
+                    tuple(slot_mapping.shape),
+                )
+        # The DSV4 shared-tuple planner exposes each layer as a contiguous
+        # region whose per-block stride still exceeds the dense page (page
+        # rows padded to the group's largest member), so the flat view below
+        # is not expressible. When no dtype conversion is involved the epilog
+        # is a pure scatter: rewrite it through torch_npu.npu_scatter_nd_update_
+        # with (block, offset) coordinates, which is stride-aware and skips
+        # [-1, -1] rows (verified against a padded as_strided cache; the
+        # aclnnScatterNdUpdateSk op dsa_v41 uses is not in this CANN's
+        # libopapi.so). Boolean-mask indexing must not be used here: it lowers
+        # to aclnnNonzeroV2, which crashes aicpu.
+        if (
+            cache.dtype == x.dtype
+            and cache.stride(-1) == 1
+            and cache.shape[2] == 1
+            and slot_mapping.ndim == 1
+        ):
+            page = cache.shape[1]
+            valid = slot_mapping >= 0
+            skip = torch.full_like(slot_mapping, -1)
+            blocks = torch.where(valid, torch.div(slot_mapping, page, rounding_mode="floor"), skip)
+            offsets = torch.where(valid, slot_mapping % page, skip)
+            indices = torch.stack([blocks, offsets], dim=-1).to(torch.int32)
+            updates = x.view(x.shape[0], -1).to(cache.dtype).contiguous()
+            torch_npu.npu_scatter_nd_update_(cache.squeeze(-2), indices, updates)
+            return
+        if (
+            not cache.is_contiguous()
+            and cache.dim() == 4
+            and cache.shape[2] == 1
+            and cache.stride(1) == cache.shape[-1]
+            and cache.stride(-1) == 1
+            and slot_mapping.ndim == 1
+        ):
+            # Quantizing epilog on padded pages: the flat view is not
+            # expressible, but each single block is a dense 128-row subview.
+            # Group the rows by block (argsort + host-side run split — no
+            # nonzero/boolean-mask indexing, those crash aicpu) and re-issue
+            # the epilog op per touched block with block-local slots. The op
+            # semantics are untouched; only the geometry packaging changes.
+            page = cache.shape[1]
+            n_blocks = cache.shape[0]
+            big = torch.iinfo(slot_mapping.dtype).max
+            slots = torch.where(slot_mapping >= 0, slot_mapping, torch.full_like(slot_mapping, big))
+            order = torch.argsort(slots)
+            slots_sorted = slots.index_select(0, order)
+            blk_sorted = torch.div(slots_sorted, page, rounding_mode="floor")
+            blk_list = blk_sorted.tolist()
+            x_rows = x.view(x.shape[0], -1)
+            i = 0
+            n = len(blk_list)
+            while i < n and blk_list[i] < n_blocks:
+                b = blk_list[i]
+                j = i + 1
+                while j < n and blk_list[j] == b:
+                    j += 1
+                sel = order[i:j]
+                local = slots_sorted[i:j] - b * page
+                torch.ops._C_ascend.kv_compress_epilog(
+                    kv_compress_cache=cache[b].view(-1, 1, cache.shape[-1]),
+                    x=x_rows.index_select(0, sel),
+                    slot_mapping=local,
+                    quant_group_size=64,
+                    quant_mode=2,
+                    round_scale_flag=True,
+                    layout=1,
+                )
+                i = j
             return
         torch.ops._C_ascend.kv_compress_epilog(
             kv_compress_cache=cache.view(-1, 1, cache.shape[-1]),

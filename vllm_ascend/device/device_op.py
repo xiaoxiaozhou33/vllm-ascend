@@ -1449,6 +1449,19 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         Returns (kv, None) to signal Part3 is a no-op."""
         if kv is None:
             return None, None
+        import os as _os
+
+        if _os.getenv("VLLM_ASCEND_DEBUG_KV_GEOM"):
+            if not getattr(A5DeviceAdaptor.indexer_quant_scatter_part1, "_probed", False):
+                A5DeviceAdaptor.indexer_quant_scatter_part1._probed = True
+                fc = indexer_full_cache.view(torch.uint8)
+                print(
+                    f"[idx_scatter] full_cache{tuple(fc.shape)} stride{tuple(fc.stride())} "
+                    f"dtype={fc.dtype} | k_cache{tuple(indexer_k_cache.shape)} "
+                    f"stride{tuple(indexer_k_cache.stride())} dtype={indexer_k_cache.dtype} | "
+                    f"kv{tuple(kv.shape)} | slot{tuple(slot_mapping.shape)}",
+                    flush=True,
+                )
         torch.ops._C_ascend.indexer_compress_epilog_v2(
             indexer_compress_cache=indexer_full_cache.view(torch.uint8),
             x=kv,

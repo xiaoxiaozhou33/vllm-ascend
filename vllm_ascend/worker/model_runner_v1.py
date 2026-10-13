@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict, deque
@@ -5033,6 +5034,17 @@ class NPUModelRunner(GPUModelRunner):
         # over-commits the device. Validate the complete geometry first, then
         # allocate exactly once and expose the contiguous per-layer regions
         # consumed by the existing page-strided DSV4 reshape path.
+        if os.getenv("VLLM_ASCEND_DEBUG_KV_GEOM"):
+            logger.warning(
+                "[kv_geom] is_dsv4_main=%s n_tensors=%d padded_layout=%s "
+                "hybrid_attn_mamba=%s use_sparse=%s use_compress=%s",
+                is_dsv4_main,
+                len(kv_cache_config.kv_cache_tensors or []),
+                uses_padded_page_layout,
+                self.hybrid_with_attn_and_mamba,
+                self.use_sparse,
+                self.use_compress,
+            )
         if is_dsv4_main and kv_cache_config.kv_cache_tensors:
             tensor_sizes = {
                 descriptor.size

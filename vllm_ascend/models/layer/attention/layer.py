@@ -30,6 +30,28 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_
 from vllm_ascend.quantization.methods.kv_cache.turboquant import SLOT_BYTES, is_turboquant
 
 
+class _Dsv4GridTable(dict):
+    """DSV4 page-grid table whose lookup clamps unknown block sizes to 128.
+
+    vLLM core shrinks cache_config.block_size to the min over all cache groups
+    after planning; on some TP shapes that min includes the 8-token
+    compressor-state group, which is not a valid grid key. The grid describes
+    the attention page layout keyed by the scheduler block size, so fall back
+    to the largest supported grid instead of KeyError-ing worker startup."""
+
+    def __getitem__(self, key):
+        if key not in self and 128 in self:
+            from vllm.logger import logger
+
+            logger.warning(
+                "[dsv4] cache_config.block_size=%s is not a page-grid key "
+                "(post-planning min over cache groups); using the 128 grid.",
+                key,
+            )
+            return dict.__getitem__(self, 128)
+        return dict.__getitem__(self, key)
+
+
 def get_dsv4_block_sizes(use_a5_bf16_kv: bool = False):
     # cache_config.block_size: [mla, swa, c4 state, c128 state], [page_size_padded_t1, page_size_padded_t2]
     _DSV4_BLOCK_SIZES = {
@@ -49,13 +71,34 @@ def get_dsv4_block_sizes(use_a5_bf16_kv: bool = False):
     }
     if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE):
         if use_a5_bf16_kv:
-            return _DSV4_BLOCK_SIZES_A5_BF16
-        return _DSV4_COMPRESSED_BLOCK_SIZES
-    return _DSV4_BLOCK_SIZES
+            return _Dsv4GridTable(_DSV4_BLOCK_SIZES_A5_BF16)
+        return _Dsv4GridTable(_DSV4_COMPRESSED_BLOCK_SIZES)
+    return _Dsv4GridTable(_DSV4_BLOCK_SIZES)
 
 
 DSV4_BLOCK_SIZES = get_dsv4_block_sizes()
 DSV4_BLOCK_SIZES_A5_BF16 = get_dsv4_block_sizes(use_a5_bf16_kv=True)
+
+
+def dsv4_block_entry(block_size, use_a5_bf16_kv: bool = False):
+    """DSV4 page-grid lookup with a clamp.
+
+    vLLM core shrinks cache_config.block_size to the min over all cache groups
+    after planning; on some TP shapes that min includes the 8-token
+    compressor-state group, which is not a valid grid key. The grid describes
+    the attention page layout keyed by the scheduler block size, so fall back
+    to the largest supported grid instead of KeyError-ing worker startup."""
+    from vllm.logger import logger
+
+    table = DSV4_BLOCK_SIZES_A5_BF16 if use_a5_bf16_kv else DSV4_BLOCK_SIZES
+    if block_size not in table:
+        logger.warning(
+            "[dsv4] cache_config.block_size=%s is not a page-grid key "
+            "(post-planning min over cache groups); using the 128 grid.",
+            block_size,
+        )
+        block_size = 128
+    return table[block_size]
 
 
 def dsv4_block_sizes(vllm_config: VllmConfig):

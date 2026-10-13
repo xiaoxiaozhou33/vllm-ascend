@@ -120,11 +120,11 @@ class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
         cache_config: CacheConfig,
     ):
         super().__init__(head_dim, window_size, torch.uint8, prefix, cache_config)
-        from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+        from vllm_ascend.models.layer.attention.layer import dsv4_block_entry as _dsv4_entry
 
         self.dtype = dtype
 
-        self.block_size = DSV4_BLOCK_SIZES[cache_config.block_size][0][1]
+        self.block_size = _dsv4_entry(cache_config.block_size)[0][1]
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         cached_head_size = self.head_dim + 128 if self.dtype == torch.float8_e4m3fn else self.head_dim
