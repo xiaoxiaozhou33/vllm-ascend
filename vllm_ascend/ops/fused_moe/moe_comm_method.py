@@ -575,10 +575,29 @@ class FusedMC2CommImpl(MoECommMethod):
         expert_tokens = None
         if self.enable_fused_mc2 == 1:
             if _EXTRA_CTX.use_mega_moe:
+                rotation_ctx = _EXTRA_CTX.rotation_ctx
+                if rotation_ctx is not None:
+                    # Expert rotation: splice the slot's rotating experts into
+                    # the per-expert lists before the fused op. The slot fill
+                    # (and prefetch chain) was already issued by
+                    # make_runtime_ctx; wait for it, then merge the views.
+                    rotation_ctx.manager.wait_slot_ready(rotation_ctx)
+                    weights = rotation_ctx.manager.build_mega_weights(weights, rotation_ctx.slot_idx)
                 out, expert_tokens = self._apply_cann_mega_moe(
                     fused_experts_input, weights, is_decode_only_node=_EXTRA_CTX.is_decode_only_node
                 )
+                if rotation_ctx is not None:
+                    # slot_free must be recorded only after the reader (the
+                    # fused op) is enqueued on the compute stream.
+                    rotation_ctx.manager.mark_slot_consumed(rotation_ctx)
             else:
+                if _EXTRA_CTX.rotation_ctx is not None:
+                    raise RuntimeError(
+                        "expert rotation requires the MegaMoe variant of fused MC2 "
+                        "(additional_config enable_fused_mc2=2); the "
+                        "dispatch_ffn_combine variant cannot receive rotating "
+                        "slot weights."
+                    )
                 assert not (weights.w1_scale_bias is None or weights.w2_scale_bias is None), (
                     "w1_scale_bias and w2_scale_bias cannot be None when enable_fused_mc2=1."
                 )

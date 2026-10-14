@@ -61,6 +61,7 @@ from vllm_ascend.expert_rotation.weight_layout import (
     RotatingComponent,
     bytes_per_expert,
     copy_storage_slice,
+    split_layer_weight_lists,
     split_layer_weights,
     supported_quant_type,
 )
@@ -79,6 +80,10 @@ class LayerRotationState:
     # merged-GMM mode: resident static weights per role (device tensors, the
     # D2D source for the combined slot's prefix)
     static_srcs: dict[str, torch.Tensor] = field(default_factory=dict)
+    # MegaMoe mode: the layer's shrunk per-expert static lists per role
+    # (list entries are the resident static experts; the fused op receives
+    # static entries + slot unbind(0) views at run time)
+    mega_static_lists: dict[str, list[torch.Tensor]] = field(default_factory=dict)
 
 
 @dataclass
@@ -111,6 +116,14 @@ class ExpertRotationManager:
         # merged-GMM mode: static (D2D) + rotating (H2D) experts gathered into
         # one combined S+R slot, single GMM per weight matrix at run time.
         self.merged_gmm = envs.VLLM_ASCEND_ER_MERGED_GMM
+        # MegaMoe mode (enable_fused_mc2=2): weights split as per-expert LISTS
+        # (the quant method disposed the raw tensors after building the
+        # cann_mega_moe_* clones); decided at the first split_layer, which runs
+        # under the same use_cann_megamoe() condition that built those lists.
+        # In this mode slots stay R-row (no merged S+R capacity, no D2D
+        # prefix) and the fused op receives static entries + slot unbind
+        # views spliced into one per-expert list.
+        self.mega_mode = False
         self.layers: dict[int, LayerRotationState] = {}
         # pre-sized mode: per-layer staging module + static->staging param map
         self._staging_modules: dict[int, torch.nn.Module] = {}
@@ -327,6 +340,17 @@ class ExpertRotationManager:
         layer = runner.routed_experts
         num_rotating = self.config.num_rotating_experts
         first = not self.slot_views
+        # MegaMoe: same condition the quant method's process_weights_after_
+        # loading evaluated when it built (and only left) the per-expert
+        # cann_mega_moe_* lists — under it the tensor split would read the
+        # disposed raw tensors, so route to the list split instead.
+        from vllm.config import get_current_vllm_config
+        from vllm_ascend.ascend_forward_context import use_cann_megamoe
+
+        if use_cann_megamoe(get_current_vllm_config()):
+            self.mega_mode = True
+            self._split_layer_mega(runner, mid, num_rotating, first)
+            return
         if self.config.pre_sized and mid in self._staging_modules:
             self._split_pre_sized(runner, mid, num_rotating, first)
             return
@@ -468,6 +492,74 @@ class ExpertRotationManager:
             state.pinned_bytes / 1024**3,
         )
 
+    def _split_layer_mega(self, runner, mid: int, num_rotating: int, first: bool) -> None:
+        """MegaMoe variant of the split: the weights live as per-expert
+        ``cann_mega_moe_*`` lists (the raw tensors were disposed by the quant
+        method's process_weights_after_loading), so the split shrinks the
+        layer's lists to the static S entries and absorbs the rotating R
+        entries' bytes into pinned. The shared slot stays one combined R-row
+        tensor per (role, slot) — the plain big-block H2D fill path — whose
+        ``unbind(0)`` views are spliced after the static entries at run time
+        (see :meth:`build_mega_weights`)."""
+        layer = runner.routed_experts
+        staging = None
+        absorb_all = False
+        if self.config.pre_sized and mid in self._staging_modules:
+            staging = self._staging_modules.pop(mid)
+            self._staging_params.pop(mid, None)
+            # Move the CPU staging params onto device for the format transform
+            # (transient: R rows per layer, freed right after absorption).
+            for _, param in staging.named_parameters():
+                param.data = param.data.npu(non_blocking=False)
+            # Same UNWRAPPED transform the static side went through; under
+            # MegaMoe this builds the staging module's cann_mega_moe_* lists
+            # (R entries) and disposes its raw tensors, so the list absorb
+            # below MUST run before any raw-tensor attr read on staging.
+            self._orig_process_weights.pop(mid, None)(staging)
+            absorb_all = True
+            target = staging
+        else:
+            target = layer
+        components = split_layer_weight_lists(
+            target,
+            runner.quant_type,
+            num_rotating,
+            num_slots=self.num_slots if first else 0,
+            absorb_all=absorb_all,
+            verify=self.config.verify_split,
+        )
+        num_local = runner.moe_config.num_local_experts
+        # Snapshot the layer's (already shrunk, or pre-created S-sized) static
+        # lists per role; the runtime hook splices the slot views after them.
+        static_lists = {role: list(getattr(layer, comp.attr)) for role, comp in components.items()}
+        state = LayerRotationState(
+            moe_instance_id=mid,
+            num_local_experts=num_local,
+            num_static=num_local - num_rotating,
+            num_rotating=num_rotating,
+            components=components,
+            pinned_bytes=sum(c.nbytes for c in components.values()),
+            static_srcs={},  # static experts stay resident as list entries
+            mega_static_lists=static_lists,
+        )
+        self.layers[mid] = state
+        self._mark_layer(runner, state)
+        self._pinned_bytes_total += state.pinned_bytes
+        if first:
+            for role, comp in components.items():
+                self.slot_views[role] = comp.slots
+            self._log_summary()
+        # free the staging module (params + storage) eagerly
+        del staging
+        torch.npu.empty_cache()
+        logger.info(
+            "[expert_rotation] layer %d split (mega): %d static + %d rotating, pinned %.2f GiB",
+            mid,
+            state.num_static,
+            state.num_rotating,
+            state.pinned_bytes / 1024**3,
+        )
+
     def _log_summary(self) -> None:
         slot_bytes = sum(
             sum(t.untyped_storage().nbytes() for t in views) for views in self.slot_views.values()
@@ -508,9 +600,27 @@ class ExpertRotationManager:
                 "requires eager execution (cudagraph_mode=NONE / --enforce-eager)."
             )
         if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+            if not _EXTRA_CTX.use_mega_moe:
+                raise RuntimeError(
+                    "[expert_rotation] the dispatch_ffn_combine variant of FUSED_MC2 "
+                    "cannot receive rotating slot weights; use the MegaMoe variant "
+                    "(additional_config enable_fused_mc2=2) or disable one of "
+                    "enable_fused_mc2 / expert_rotation_config."
+                )
+            if not self.mega_mode:
+                raise RuntimeError(
+                    "[expert_rotation] FUSED_MC2+MegaMoe forward but the weights were "
+                    "split with the tensor layout (not in mega list mode); the fused "
+                    "path cannot consume them."
+                )
+            # mega fused path: the slot fill / prefetch chain below proceeds
+            # exactly as on the split paths; the rotating experts enter the
+            # fused op through build_mega_weights at the call site.
+        elif self.mega_mode:
             raise RuntimeError(
-                "[expert_rotation] FUSED_MC2 (fused dispatch_ffn_combine/mega_moe) cannot "
-                "split the MLP stage; disable enable_fused_mc2 or expert_rotation_config."
+                "[expert_rotation] weights were split in MegaMoe list mode but this "
+                "forward selected a non-fused comm method; the GMM split path "
+                "cannot consume list-split weights."
             )
 
         slot_idx = moe_instance_id % self.num_slots
@@ -560,8 +670,11 @@ class ExpertRotationManager:
         """
         state = self.layers[moe_instance_id]
         slot = self.slot_states[slot_idx]
+        # mega list mode: slots are plain R-row buffers (no S+R capacity, no
+        # D2D static prefix) — always take the big-block H2D fill.
+        merged_fill = self.merged_gmm and not self.mega_mode
         if self.copy_stream is not None:
-            if not self.merged_gmm:
+            if not merged_fill:
                 with torch.npu.stream(self.copy_stream):
                     self.copy_stream.wait_event(slot.slot_free)
                     for comp in state.components.values():
@@ -610,7 +723,7 @@ class ExpertRotationManager:
             cur.wait_event(slot.slot_free)
             for comp in state.components.values():
                 slot_t = self.slot_views[comp.role][slot_idx]
-                if self.merged_gmm:
+                if merged_fill:
                     num_static = state.num_static
                     per_e = bytes_per_expert(slot_t)
                     copy_storage_slice(
@@ -684,6 +797,45 @@ class ExpertRotationManager:
             w2=pick("w2", weights.w2),
             w1_scale=pick("w1_scale", weights.w1_scale),
             w2_scale=pick("w2_scale", weights.w2_scale),
+        )
+
+    def build_mega_weights(self, weights, slot_idx: int):
+        """Splice the slot's rotating experts into a MegaMoe per-expert payload.
+
+        The MegaMoe op consumes one per-expert tensor list covering ALL local
+        experts in slot order; local ids [0,S) are the resident static entries
+        (already in ``weights`` from get_fused_mc2_weights) and [S,S+R) are
+        the slot tensor's ``unbind(0)`` views — the same view-over-combined-
+        NZ-tensor form the op's W8A8Dynamic path ships. No remapping of
+        topk_ids is needed: EP sharding is contiguous, so local slot order
+        matches the global expert ids the op routes by.
+        """
+        from dataclasses import replace
+
+        def merge(role: str, cur: Any) -> Any:
+            if cur is None:
+                return None
+            views = self.slot_views.get(role)
+            if views is None:
+                raise RuntimeError(f"[expert_rotation] no slot view for role {role}")
+            entries = list(views[slot_idx].unbind(0))
+            if isinstance(cur, list):
+                return list(cur) + entries
+            return [cur] + entries
+
+        for bias_role in ("w1_bias", "w2_bias", "w1_offset", "w2_offset"):
+            if getattr(weights, bias_role, None) is not None:
+                raise RuntimeError(
+                    f"[expert_rotation] {bias_role} is set; per-expert biases/offsets are "
+                    "not supported by expert rotation yet."
+                )
+
+        return replace(
+            weights,
+            w1=merge("w1", weights.w1),
+            w2=merge("w2", weights.w2),
+            w1_scale=merge("w1_scale", weights.w1_scale),
+            w2_scale=merge("w2_scale", weights.w2_scale),
         )
 
 

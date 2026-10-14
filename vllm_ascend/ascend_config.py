@@ -998,8 +998,12 @@ class AscendConfig:
         problems = []
         if self.eplb_config.dynamic_eplb:
             problems.append("dynamic EPLB reassigns experts to slots at runtime, which breaks the fixed static/rotating split")
-        if self.enable_fused_mc2 == 1:
-            problems.append("enable_fused_mc2 fuses dispatch+MLP+combine into one operator and cannot split the MLP stage")
+        if self.enable_fused_mc2 == 1 and not is_mega_moe_supported():
+            problems.append(
+                "enable_fused_mc2 (dispatch_ffn_combine variant) fuses dispatch+MLP+combine "
+                "into one operator and cannot receive rotating slot weights; the MegaMoe "
+                "variant (enable_fused_mc2=2) is compatible with expert rotation"
+            )
         if problems:
             raise ValueError(
                 "expert_rotation_config is incompatible with the current configuration: "

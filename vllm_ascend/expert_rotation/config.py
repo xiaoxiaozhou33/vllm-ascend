@@ -45,10 +45,13 @@ class ExpertRotationConfig:
         # host pinned memory and the two shared HBM slots.
         "num_rotating_experts": 0,
         # What to do when a forward hits an unsupported condition (graph
-        # capture, draft-model-only features, fused MC2, ...):
+        # capture, draft-model-only features, the non-MegaMoe fused MC2
+        # variant, ...):
         #   "sync_load" - synchronously load the rotating block on the current
         #                 stream before use (slow but numerically identical)
         #   "error"     - fail fast with a clear message
+        # Note: the MegaMoe variant (enable_fused_mc2=2) IS supported — the
+        # rotating experts enter the fused op as per-expert list entries.
         "fallback_mode": "sync_load",
         # When False the rotating block is loaded synchronously at the wait
         # point (phase-0 correctness mode). When True a dedicated copy stream

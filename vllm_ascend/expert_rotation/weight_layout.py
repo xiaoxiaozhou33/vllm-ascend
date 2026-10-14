@@ -243,6 +243,32 @@ def supported_quant_type(quant_type: QuantType) -> bool:
     return any(qt == quant_type for qt, _ in _ROLE_SPECS)
 
 
+# MegaMoe (enable_fused_mc2=2) weight split. Under MegaMoe the quant method's
+# process_weights_after_loading builds per-expert FRACTAL_NZ clones and then
+# DISPOSES the raw expert tensors (e.g. w4a8_mxfp4.py), so the tensor-based
+# split above cannot see the weights at all. The split therefore operates on
+# the per-expert lists: the first S entries stay resident on the layer, the
+# last R entries are absorbed (byte-wise, in list order) into one pinned
+# buffer, and the shared slot is ONE combined R-row tensor per (role, slot)
+# whose unbind(0) views re-enter the weight lists at run time — the same
+# view-over-combined-tensor form MegaMoe's W8A8Dynamic path already ships.
+# Layout invariant reused from the tensor split: dim 0 is storage-major, so
+# concatenating per-expert NZ storages in order equals the combined tensor's
+# storage, per role and per quant method.
+_MEGA_ROLE_SPECS: dict[tuple[QuantType, str], _RoleSpec] = {
+    (QuantType.W4A8MXFP, "w1"): _RoleSpec(attrs=("cann_mega_moe_w13_weight_list",)),
+    (QuantType.W4A8MXFP, "w2"): _RoleSpec(attrs=("cann_mega_moe_w2_weight_list",)),
+    (QuantType.W4A8MXFP, "w1_scale"): _RoleSpec(attrs=("cann_mega_moe_w13_weight_scale_list",)),
+    (QuantType.W4A8MXFP, "w2_scale"): _RoleSpec(attrs=("cann_mega_moe_w2_weight_scale_list",)),
+}
+
+MEGA_SUPPORTED_QUANT_TYPES = tuple(dict.fromkeys(qt for qt, _ in _MEGA_ROLE_SPECS))
+
+
+def mega_supported_quant_type(quant_type: QuantType) -> bool:
+    return any(qt == quant_type for qt, _ in _MEGA_ROLE_SPECS)
+
+
 def split_layer_weights(
     layer: torch.nn.Module,
     quant_type: QuantType,
@@ -352,3 +378,149 @@ def fill_slot_from_pinned(slot: torch.Tensor, pinned: torch.Tensor, stream: torc
     """One big-block H2D per component; the whole R-expert suffix is contiguous."""
     with torch.npu.stream(stream):
         copy_storage_slice(slot, pinned.untyped_storage(), non_blocking=True)
+
+
+def absorb_list_to_pinned(entries: list[torch.Tensor]) -> torch.Tensor:
+    """D2H a per-expert tensor list's bytes, concatenated in list order.
+
+    Every entry must be a standalone allocation of identical storage size
+    (per-expert ``clone()``s from the quant method's MegaMoe list build).
+    View entries (e.g. W8A8Dynamic's ``unbind`` of one combined tensor) share
+    a larger storage and are rejected: the pinned block could not address them
+    uniformly.
+    """
+    per_e = entries[0].untyped_storage().nbytes()
+    for e in entries:
+        if e.untyped_storage().nbytes() != per_e:
+            raise ValueError(
+                "expert rotation mega split: per-expert list entries have unequal "
+                f"storage sizes ({per_e} vs {e.untyped_storage().nbytes()}); view-style "
+                "lists (unbind of one combined tensor) are not supported as an "
+                "absorb source."
+            )
+    pinned = torch.empty(len(entries) * per_e, dtype=torch.uint8, pin_memory=True)
+    for i, e in enumerate(entries):
+        copy_storage_slice(pinned, e.untyped_storage(), dst_offset=i * per_e, nbytes=per_e)
+    return pinned
+
+
+def _verify_list_split_bytes(entries: list[torch.Tensor], pinned: torch.Tensor) -> None:
+    """Load-time sanity: the pinned block must reproduce each entry's bytes."""
+    per_e = entries[0].untyped_storage().nbytes()
+    host = torch.empty(per_e, dtype=torch.uint8, pin_memory=True)
+    for i, e in enumerate(entries):
+        host.untyped_storage()[0:per_e].copy_(e.untyped_storage()[0:per_e])
+        if not torch.equal(host, pinned[i * per_e : (i + 1) * per_e]):
+            raise RuntimeError(
+                f"expert rotation mega split verification failed at entry {i}; "
+                "the list layout does not survive the byte-level split."
+            )
+    del host
+
+
+def _build_list_slot(
+    template: torch.Tensor, num_rows: int, *, quant_type: QuantType
+) -> torch.Tensor:
+    """One combined ``(num_rows, *template.shape)`` slot for a per-expert list.
+
+    Unlike :func:`_rebuild_expert_rows` the template here is a SINGLE expert's
+    entry: dim 0 must be prepended, never sliced (the ND path there,
+    ``template[:num_rows]``, would return a slice into one expert — the scale
+    entries' leading dim is 2*inter/hidden, far larger than R). Contents are
+    don't-care: every fill overwrites the whole slot storage. NZ entries are
+    cast with the same recipe the quant method used for their per-expert
+    clones; with leading dims divisible by 16 the combined NZ storage is
+    exactly ``num_rows`` entry storages concatenated, which the fill (and the
+    unbind(0) views) rely on — asserted below to fail at load time, not mid-
+    forward, if a layout ever breaks that.
+    """
+    new = torch.empty((num_rows, *template.shape), dtype=template.dtype, device=template.device)
+    if is_nz_tensor(template):
+        new = _nz_cast_like(quant_type, new, template)
+    per_e = template.untyped_storage().nbytes()
+    if new.untyped_storage().nbytes() != num_rows * per_e:
+        raise RuntimeError(
+            f"expert rotation (mega): combined slot storage "
+            f"{new.untyped_storage().nbytes()}B != {num_rows} x {per_e}B entry storage; "
+            "NZ padding is not expert-aligned for this shape and the byte-level "
+            "split/fill cannot be used."
+        )
+    return new
+
+
+def split_layer_weight_lists(
+    layer: torch.nn.Module,
+    quant_type: QuantType,
+    num_rotating: int,
+    *,
+    num_slots: int = 0,
+    absorb_all: bool = False,
+    verify: bool = False,
+) -> dict[str, RotatingComponent]:
+    """MegaMoe variant of :func:`split_layer_weights`, operating on per-expert lists.
+
+    Called right after the quant method's ``process_weights_after_loading``
+    built the ``cann_mega_moe_*`` lists (and disposed the raw tensors). The
+    layer's list attribute is shrunk in place to the first ``E - R`` entries;
+    the suffix entries' bytes are absorbed into one pinned buffer and a
+    combined R-row slot tensor per slot is created (its ``unbind(0)`` views
+    re-enter the fused op's weight lists at run time).
+
+    ``absorb_all=True`` is the pre-sized staging mode: ``layer`` is the
+    staging module whose lists already hold exactly ``R`` entries — consume
+    them all without shrinking.
+    """
+    if not mega_supported_quant_type(quant_type):
+        raise ValueError(
+            f"expert rotation + MegaMoe does not support quant_type={quant_type} yet "
+            f"(supported: {[qt.name for qt in MEGA_SUPPORTED_QUANT_TYPES]})"
+        )
+    components: dict[str, RotatingComponent] = {}
+    for (qt, role), spec in _MEGA_ROLE_SPECS.items():
+        if qt != quant_type:
+            continue
+        attr = next((a for a in spec.attrs if getattr(layer, a, None) is not None), None)
+        if attr is None:
+            if role in _REQUIRED_ROLES:
+                raise ValueError(f"expert rotation (mega): layer has none of {spec.attrs}")
+            continue  # optional component (scales)
+        entries = list(getattr(layer, attr))
+        if absorb_all:
+            if len(entries) != num_rotating:
+                raise RuntimeError(
+                    f"expert rotation (mega) pre-sized staging {attr} has {len(entries)} "
+                    f"entries, expected {num_rotating}"
+                )
+            rotating = entries
+        else:
+            num_static = len(entries) - num_rotating
+            if num_static <= 0:
+                raise ValueError(
+                    f"num_rotating_experts={num_rotating} must be smaller than the local "
+                    f"expert count {len(entries)} (attr {attr})"
+                )
+            rotating = entries[num_static:]
+            # plain python-list attribute (not a Parameter): shrink in place
+            setattr(layer, attr, entries[:num_static])
+        pinned = absorb_list_to_pinned(rotating)
+        if verify:
+            _verify_list_split_bytes(rotating, pinned)
+        # One combined R-entry tensor per slot: (R, *entry.shape), NZ-cast for
+        # the weight entries (their clones were cast per expert, pre-transpose
+        # (out, in) layout). NOT _rebuild_expert_rows: its template is a
+        # combined (E, ...) tensor and its ND path would slice INTO one expert
+        # here (entry.shape[0] is 2*inter/hidden, not the expert count).
+        slots = [
+            _build_list_slot(rotating[0], num_rotating, quant_type=quant_type)
+            for _ in range(num_slots)
+        ]
+        # release the absorbed entries eagerly, layer by layer: in absorb_all
+        # mode the staging module's attr is the last strong reference.
+        if absorb_all:
+            setattr(layer, attr, [])
+        del rotating, entries
+        torch.npu.empty_cache()
+        components[role] = RotatingComponent(
+            role=role, attr=attr, pinned=pinned, slots=slots, nbytes=pinned.untyped_storage().nbytes()
+        )
+    return components
