@@ -502,6 +502,29 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
         return param_dict
 
     def process_weights_after_loading(self, layer):
+        # MegaMoe (enable_fused_mc2=2 on A5): build the fused op's weight
+        # payload instead of the GMM-facing cast+transpose below, then
+        # dispose the raw tensors. arch35 (A5) form, reverse-engineered from
+        # the op's runtime checks (EZ0009/EZ0010/EZ0011/EZ0024):
+        #   - weight1/2: ONE 3D int8 tensor per rank, (E_local, out,
+        #     in_bytes); weight1[0].dim0 IS the experts-per-rank the tiling
+        #     derives, fp4(dim2 of w1) must equal dim1 of w2 and h of x;
+        #     weight1_type=FP4 carries the fp4 semantics over the int8 bytes
+        #     (the IR declares no FP4 tensor dtype; NZ casts are rejected).
+        #   - scales: one 4D e8m0 tensor per rank, reshaped (E, n, k//2, 2)
+        #     but NOT transposed (the GMM form transposes -3/-2).
+        if use_cann_megamoe(get_current_vllm_config()):
+            layer.cann_mega_moe_w13_weight_list = [layer.w13_weight.data.view(torch.int8).clone()]
+            layer.cann_mega_moe_w2_weight_list = [layer.w2_weight.data.view(torch.int8).clone()]
+            g, n, k = layer.w13_weight_scale.shape
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g, n, k // 2, 2)
+            g, n, k = layer.w2_weight_scale.shape
+            layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g, n, k // 2, 2)
+            layer.cann_mega_moe_w13_weight_scale_list = [layer.w13_weight_scale.data.clone()]
+            layer.cann_mega_moe_w2_weight_scale_list = [layer.w2_weight_scale.data.clone()]
+            for tensor_name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+                dispose_tensor(getattr(layer, tensor_name))
+            return
         layer.w13_weight.data = torch_npu.npu_format_cast(
             layer.w13_weight.data.view(torch.uint8),
             ACL_FORMAT_FRACTAL_NZ,

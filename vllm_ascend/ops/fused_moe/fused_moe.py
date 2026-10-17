@@ -140,10 +140,17 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         setup_moe_comm_method(self.moe_config)
         # Communication objects are shared across MoE layers. Keep the bound
         # activation with its owning layer when a later layer replaces them.
+        # Lookups must key on the SAME moe_config used at registration
+        # (_moe_config_key includes (num_experts, num_local_experts)); a
+        # config-less lookup lands on the (0, 0) key, misses, and silently
+        # leaves mega_moe_activation_kwargs None -> "**None" at the first
+        # MegaMoe call.
         self.routed_experts.mega_moe_activation_kwargs = getattr(
-            get_moe_comm_method(MoECommType.FUSED_MC2), "mega_moe_activation_kwargs", None
+            get_moe_comm_method(MoECommType.FUSED_MC2, self.moe_config),
+            "mega_moe_activation_kwargs",
+            None,
         )
-        alltoall_comm = get_moe_comm_method(MoECommType.ALLTOALL)
+        alltoall_comm = get_moe_comm_method(MoECommType.ALLTOALL, self.moe_config)
         if alltoall_comm is not None:
             expert_ids_per_ep_rank = getattr(alltoall_comm.token_dispatcher, "expert_ids_per_ep_rank", None)
             if expert_ids_per_ep_rank is not None:
