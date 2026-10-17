@@ -80,10 +80,6 @@ class LayerRotationState:
     # merged-GMM mode: resident static weights per role (device tensors, the
     # D2D source for the combined slot's prefix)
     static_srcs: dict[str, torch.Tensor] = field(default_factory=dict)
-    # MegaMoe mode: the layer's shrunk per-expert static lists per role
-    # (list entries are the resident static experts; the fused op receives
-    # static entries + slot unbind(0) views at run time)
-    mega_static_lists: dict[str, list[torch.Tensor]] = field(default_factory=dict)
 
 
 @dataclass
@@ -493,14 +489,15 @@ class ExpertRotationManager:
         )
 
     def _split_layer_mega(self, runner, mid: int, num_rotating: int, first: bool) -> None:
-        """MegaMoe variant of the split: the weights live as per-expert
-        ``cann_mega_moe_*`` lists (the raw tensors were disposed by the quant
-        method's process_weights_after_loading), so the split shrinks the
-        layer's lists to the static S entries and absorbs the rotating R
-        entries' bytes into pinned. The shared slot stays one combined R-row
-        tensor per (role, slot) — the plain big-block H2D fill path — whose
-        ``unbind(0)`` views are spliced after the static entries at run time
-        (see :meth:`build_mega_weights`)."""
+        """MegaMoe variant of the split: the weights live as the fused op's
+        single-tensor ``cann_mega_moe_*`` payload (the raw tensors were
+        disposed by the quant method's process_weights_after_loading), so the
+        split shrinks the payload along dim 0 to a standalone (S, ...) rebuild
+        and absorbs the rotating R rows' bytes into pinned. The shared slot is
+        one combined (S+R, ...) tensor per (role, slot) — the merged-GMM
+        combined-slot form; at run time the op's weight tensor IS the slot
+        view (see :meth:`build_mega_weights`), filled with the static prefix
+        D2D + rotating suffix H2D (see :meth:`_fill_slot`)."""
         layer = runner.routed_experts
         staging = None
         absorb_all = False
@@ -512,26 +509,28 @@ class ExpertRotationManager:
             for _, param in staging.named_parameters():
                 param.data = param.data.npu(non_blocking=False)
             # Same UNWRAPPED transform the static side went through; under
-            # MegaMoe this builds the staging module's cann_mega_moe_* lists
-            # (R entries) and disposes its raw tensors, so the list absorb
+            # MegaMoe this builds the staging module's single-tensor payload
+            # (R expert rows) and disposes its raw tensors, so the absorb
             # below MUST run before any raw-tensor attr read on staging.
             self._orig_process_weights.pop(mid, None)(staging)
             absorb_all = True
             target = staging
         else:
             target = layer
+        num_local = runner.moe_config.num_local_experts
         components = split_layer_weight_lists(
             target,
             runner.quant_type,
             num_rotating,
             num_slots=self.num_slots if first else 0,
+            slot_capacity=num_local,
             absorb_all=absorb_all,
             verify=self.config.verify_split,
         )
-        num_local = runner.moe_config.num_local_experts
-        # Snapshot the layer's (already shrunk, or pre-created S-sized) static
-        # lists per role; the runtime hook splices the slot views after them.
-        static_lists = {role: list(getattr(layer, comp.attr)) for role, comp in components.items()}
+        # Static D2D sources: the layer's (shrunk, or pre-created S-sized)
+        # standalone payload tensors per role — they fill the combined slot's
+        # prefix at every rotation, exactly like merged-GMM mode.
+        static_srcs = {role: getattr(layer, comp.attr)[0] for role, comp in components.items()}
         state = LayerRotationState(
             moe_instance_id=mid,
             num_local_experts=num_local,
@@ -539,8 +538,7 @@ class ExpertRotationManager:
             num_rotating=num_rotating,
             components=components,
             pinned_bytes=sum(c.nbytes for c in components.values()),
-            static_srcs={},  # static experts stay resident as list entries
-            mega_static_lists=static_lists,
+            static_srcs=static_srcs,
         )
         self.layers[mid] = state
         self._mark_layer(runner, state)
@@ -670,9 +668,10 @@ class ExpertRotationManager:
         """
         state = self.layers[moe_instance_id]
         slot = self.slot_states[slot_idx]
-        # mega list mode: slots are plain R-row buffers (no S+R capacity, no
-        # D2D static prefix) — always take the big-block H2D fill.
-        merged_fill = self.merged_gmm and not self.mega_mode
+        # mega mode: slots are combined (S+R) buffers like merged-GMM — the
+        # static prefix is D2D-gathered from the resident payload while the
+        # rotating suffix streams H2D from pinned.
+        merged_fill = self.merged_gmm or self.mega_mode
         if self.copy_stream is not None:
             if not merged_fill:
                 with torch.npu.stream(self.copy_stream):
@@ -800,28 +799,24 @@ class ExpertRotationManager:
         )
 
     def build_mega_weights(self, weights, slot_idx: int):
-        """Splice the slot's rotating experts into a MegaMoe per-expert payload.
+        """Swap the MegaMoe payload for this slot's combined weight tensors.
 
-        The MegaMoe op consumes one per-expert tensor list covering ALL local
-        experts in slot order; local ids [0,S) are the resident static entries
-        (already in ``weights`` from get_fused_mc2_weights) and [S,S+R) are
-        the slot tensor's ``unbind(0)`` views — the same view-over-combined-
-        NZ-tensor form the op's W8A8Dynamic path ships. No remapping of
-        topk_ids is needed: EP sharding is contiguous, so local slot order
-        matches the global expert ids the op routes by.
+        CANN 9.2.0's MegaMoe consumes ONE tensor per rank per role (list of
+        exactly one element, dim 0 = local experts); the combined (S+R)-row
+        slot IS that tensor — static prefix and rotating suffix were fused at
+        fill time. No remapping of topk_ids is needed: EP sharding is
+        contiguous, so slot row order matches the global expert ids the op
+        routes by.
         """
         from dataclasses import replace
 
-        def merge(role: str, cur: Any) -> Any:
+        def pick(role: str, cur: Any) -> Any:
             if cur is None:
                 return None
             views = self.slot_views.get(role)
             if views is None:
                 raise RuntimeError(f"[expert_rotation] no slot view for role {role}")
-            entries = list(views[slot_idx].unbind(0))
-            if isinstance(cur, list):
-                return list(cur) + entries
-            return [cur] + entries
+            return [views[slot_idx]]
 
         for bias_role in ("w1_bias", "w2_bias", "w1_offset", "w2_offset"):
             if getattr(weights, bias_role, None) is not None:
@@ -832,10 +827,10 @@ class ExpertRotationManager:
 
         return replace(
             weights,
-            w1=merge("w1", weights.w1),
-            w2=merge("w2", weights.w2),
-            w1_scale=merge("w1_scale", weights.w1_scale),
-            w2_scale=merge("w2_scale", weights.w2_scale),
+            w1=pick("w1", weights.w1),
+            w2=pick("w2", weights.w2),
+            w1_scale=pick("w1_scale", weights.w1_scale),
+            w2_scale=pick("w2_scale", weights.w2_scale),
         )
 
 
