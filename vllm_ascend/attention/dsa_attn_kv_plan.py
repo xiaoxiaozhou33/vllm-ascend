@@ -105,6 +105,20 @@ class DsaAttnKvPlan:
         if self.uses_sparse_flash_mla:
             if slot_mapping.ndim != 1:
                 raise ValueError(f"BF16 DSA slot_mapping must be [num_tokens], got {tuple(slot_mapping.shape)}.")
+            if cache.dim() == 4 and cache.shape[2] == 1 and cache.stride(-1) == 1 and not cache.is_contiguous():
+                # Padded pages (hybrid planner common_page_size): flatten would
+                # silently materialize a copy and the scatter below would write
+                # to it. Route through the stride-aware 2-level scatter shared
+                # with the epilog branch instead. [-1, -1] rows are skipped.
+                page = cache.shape[1]
+                valid = slot_mapping >= 0
+                skip = torch.full_like(slot_mapping, -1)
+                blocks = torch.where(valid, torch.div(slot_mapping, page, rounding_mode="floor"), skip)
+                offsets = torch.where(valid, slot_mapping % page, skip)
+                indices = torch.stack([blocks, offsets], dim=-1).to(torch.int32)
+                updates = x.view(x.shape[0], -1).to(cache.dtype).contiguous()
+                torch_npu.npu_scatter_nd_update_(cache.squeeze(-2), indices, updates)
+                return
             # Flatten the paged cache and keep a static [T, 1] index tensor so
             # ACLGraph capture matches the A5 FP8 / SFA one-dimensional slot
             # convention. Do not clamp PAD_SLOT_ID (-1) to 0: that overwrites
@@ -116,6 +130,31 @@ class DsaAttnKvPlan:
             return
         if not self.uses_kv_compress_epilog:
             torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, slot_mapping, x)
+            return
+        # The 0.29 hybrid planner pads every page in a mixed group to the
+        # largest member's page size (attn_utils common_page_size), so the
+        # paged cache stride exceeds the dense page and the flat view below
+        # is not expressible. When no dtype conversion is involved the epilog
+        # is a pure scatter: rewrite it through torch_npu.npu_scatter_nd_update_
+        # with (block, offset) coordinates, which is stride-aware and skips
+        # [-1, -1] rows (verified against a padded as_strided cache; the
+        # aclnnScatterNdUpdateSk op dsa_v41 uses is not in this CANN's
+        # libopapi.so). Boolean-mask indexing must not be used here: it lowers
+        # to aclnnNonzeroV2, which crashes aicpu.
+        if (
+            cache.dtype == x.dtype
+            and cache.stride(-1) == 1
+            and cache.shape[2] == 1
+            and slot_mapping.ndim == 1
+        ):
+            page = cache.shape[1]
+            valid = slot_mapping >= 0
+            skip = torch.full_like(slot_mapping, -1)
+            blocks = torch.where(valid, torch.div(slot_mapping, page, rounding_mode="floor"), skip)
+            offsets = torch.where(valid, slot_mapping % page, skip)
+            indices = torch.stack([blocks, offsets], dim=-1).to(torch.int32)
+            updates = x.view(x.shape[0], -1).to(cache.dtype).contiguous()
+            torch_npu.npu_scatter_nd_update_(cache.squeeze(-2), indices, updates)
             return
         torch.ops._C_ascend.kv_compress_epilog(
             kv_compress_cache=cache.view(-1, 1, cache.shape[-1]),
