@@ -2273,5 +2273,27 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 assert compress_topk_idxs is not None
                 attn_kwargs["cmp_sparse_indices"] = compress_topk_idxs
 
+        # TEMP DEBUG (VLLM_ASCEND_DEBUG_ATTN_KWARGS=1): one-shot dump of every
+        # kernel input on the first real attention call, for tiling-failure
+        # triage. Remove together with the kv-scatter debug.
+        import os as _os
+
+        if _os.getenv("VLLM_ASCEND_DEBUG_ATTN_KWARGS", "0") == "1" and not globals().get("_DBG_ATTN_DUMPED", False):
+            globals()["_DBG_ATTN_DUMPED"] = True
+            print(f"[attn-dbg] op={attn_op} q={tuple(q.shape)} stride{tuple(q.stride())} {q.dtype}", flush=True)
+            _saved = {"q": q.detach().clone()}
+            for _k, _v in attn_kwargs.items():
+                if torch.is_tensor(_v):
+                    print(f"[attn-dbg]   {_k}: tensor{tuple(_v.shape)} stride{tuple(_v.stride())} {_v.dtype}", flush=True)
+                    if _k not in ("ori_kv", "cmp_kv"):
+                        _saved[_k] = _v.detach().clone()
+                else:
+                    print(f"[attn-dbg]   {_k} = {_v}", flush=True)
+                    _saved[f"__{_k}"] = _v
+            _saved["__ori_kv_shape"] = tuple(attn_kwargs["ori_kv"].shape)
+            _saved["__ori_kv_stride"] = tuple(attn_kwargs["ori_kv"].stride())
+            torch.save(_saved, f"/tmp/attn_dbg_inputs_{_os.getpid()}.pt")
+            print(f"[attn-dbg] inputs saved pid={_os.getpid()}", flush=True)
+
         with attention_transfer_window():
             return attn_op(q, **attn_kwargs)[0]

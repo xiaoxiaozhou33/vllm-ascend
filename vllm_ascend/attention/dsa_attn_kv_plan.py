@@ -51,6 +51,9 @@ def is_a5_bf16_kv_enabled(vllm_config) -> bool:
 DSA_COMPRESSOR_SLOT_MAPPING_FLAT = 1
 DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET = 2
 
+# TEMP DEBUG: signatures already printed by VLLM_ASCEND_DEBUG_KV_SCATTER.
+_DBG_SEEN_SIGS: set = set()
+
 
 @dataclass(frozen=True)
 class DsaAttnKvPlan:
@@ -102,6 +105,39 @@ class DsaAttnKvPlan:
     def dsa_kv_compress_scatter(self, cache: torch.Tensor, x: torch.Tensor | None, slot_mapping: torch.Tensor) -> None:
         if x is None:
             return
+        # TEMP DEBUG (VLLM_ASCEND_DEBUG_KV_SCATTER=1): capture the live cache
+        # geometry that feeds the view() calls below. Prints once per unique
+        # (shape, stride) signature; on failure prints everything.
+        import os as _os
+        if _os.getenv("VLLM_ASCEND_DEBUG_KV_SCATTER", "0") == "1":
+            sig = (tuple(cache.shape), tuple(cache.stride()), cache.storage_offset())
+            if sig not in _DBG_SEEN_SIGS:
+                _DBG_SEEN_SIGS.add(sig)
+                print(
+                    f"[kv-scatter-dbg] plan(sfm={self.uses_sparse_flash_mla}, "
+                    f"epilog={self.uses_kv_compress_epilog}, layout={self.layout_kv}) "
+                    f"cache{tuple(cache.shape)} stride{tuple(cache.stride())} "
+                    f"off={cache.storage_offset()} dtype={cache.dtype} "
+                    f"contig={cache.is_contiguous()} | x{tuple(x.shape)} "
+                    f"xstride{tuple(x.stride())} | slot{tuple(slot_mapping.shape)}",
+                    flush=True,
+                )
+            try:
+                self._dsa_kv_compress_scatter_impl(cache, x, slot_mapping)
+            except RuntimeError:
+                print(
+                    f"[kv-scatter-dbg] FAILED cache{tuple(cache.shape)} "
+                    f"stride{tuple(cache.stride())} off={cache.storage_offset()} "
+                    f"dtype={cache.dtype} contig={cache.is_contiguous()} | "
+                    f"x{tuple(x.shape)} xstride{tuple(x.stride())} | "
+                    f"slot{tuple(slot_mapping.shape)}",
+                    flush=True,
+                )
+                raise
+            return
+        self._dsa_kv_compress_scatter_impl(cache, x, slot_mapping)
+
+    def _dsa_kv_compress_scatter_impl(self, cache: torch.Tensor, x: torch.Tensor | None, slot_mapping: torch.Tensor) -> None:
         if self.uses_sparse_flash_mla:
             if slot_mapping.ndim != 1:
                 raise ValueError(f"BF16 DSA slot_mapping must be [num_tokens], got {tuple(slot_mapping.shape)}.")
