@@ -514,8 +514,30 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
         #   - scales: one 4D e8m0 tensor per rank, reshaped (E, n, k//2, 2)
         #     but NOT transposed (the GMM form transposes -3/-2).
         if use_cann_megamoe(get_current_vllm_config()):
-            layer.cann_mega_moe_w13_weight_list = [layer.w13_weight.data.view(torch.int8).clone()]
-            layer.cann_mega_moe_w2_weight_list = [layer.w2_weight.data.view(torch.int8).clone()]
+            # A5 MXFP form per the 9.2.0 op doc: ONE tensor per rank, byte
+            # shape (E_local, out, in_bytes). The customize-dtype cast to
+            # ACL_FORMAT_FRACTAL_NZ produces the FP4-tagged
+            # FRACTAL_NZ_C0_32 layout the doc requires ("FLOAT4_E2M1类型的
+            # l1_weights必须使用FRACTAL_NZ_C0_32格式"); casting straight to
+            # format 51 raises aclnn 361001 on this torch_npu. Scales are one
+            # 4D e8m0 tensor (E, n, CeilDiv(in, 64), 2), reshaped but NOT
+            # transposed.
+            layer.cann_mega_moe_w13_weight_list = [
+                torch_npu.npu_format_cast(
+                    layer.w13_weight.data.view(torch.int8).clone(),
+                    ACL_FORMAT_FRACTAL_NZ,
+                    customize_dtype=torch.float8_e4m3fn,
+                    input_dtype=torch_npu.float4_e2m1fn_x2,
+                )
+            ]
+            layer.cann_mega_moe_w2_weight_list = [
+                torch_npu.npu_format_cast(
+                    layer.w2_weight.data.view(torch.int8).clone(),
+                    ACL_FORMAT_FRACTAL_NZ,
+                    customize_dtype=torch.float8_e4m3fn,
+                    input_dtype=torch_npu.float4_e2m1fn_x2,
+                )
+            ]
             g, n, k = layer.w13_weight_scale.shape
             layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g, n, k // 2, 2)
             g, n, k = layer.w2_weight_scale.shape

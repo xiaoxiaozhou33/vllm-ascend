@@ -573,7 +573,9 @@ class FusedMC2CommImpl(MoECommMethod):
                     # (and prefetch chain) was already issued by
                     # make_runtime_ctx; wait for it, then merge the views.
                     rotation_ctx.manager.wait_slot_ready(rotation_ctx)
-                    weights = rotation_ctx.manager.build_mega_weights(weights, rotation_ctx.slot_idx)
+                    weights = rotation_ctx.manager.build_mega_weights(
+                        weights, rotation_ctx.slot_idx, rotation_ctx.moe_instance_id
+                    )
                 out, expert_tokens = self._apply_cann_mega_moe(
                     fused_experts_input, weights, is_decode_only_node=_EXTRA_CTX.is_decode_only_node
                 )

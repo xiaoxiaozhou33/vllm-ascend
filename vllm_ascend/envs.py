@@ -92,6 +92,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # static/rotating two-segment GMM pair. "1" (default): merged single GMM.
     # "0": legacy two-GMM split. This configuration is not sensitive.
     "VLLM_ASCEND_ER_MERGED_GMM": lambda: _strict_binary_env("VLLM_ASCEND_ER_MERGED_GMM", "1"),
+    # Expert rotation + MegaMoe: pass the fused op its per-expert TensorList
+    # form (weight 2-D, scale 3-D; 950PR MXFP supports this alongside the
+    # stacked single-tensor form) — static experts enter as zero-copy views of
+    # the resident payload and only the R rotating rows get a slot, so the
+    # per-layer static-prefix D2D gather disappears entirely.
+    # "0" (default): stacked combined (S+R) slot as before. Not sensitive.
+    "VLLM_ASCEND_ER_LIST_LAYOUT": lambda: _strict_binary_env("VLLM_ASCEND_ER_LIST_LAYOUT", "0"),
 }
 
 # end-env-vars-definition

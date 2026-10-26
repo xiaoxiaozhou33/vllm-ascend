@@ -414,6 +414,7 @@ def split_layer_weight_lists(
     slot_capacity: int | None = None,
     absorb_all: bool = False,
     verify: bool = False,
+    list_layout: bool = False,
 ) -> dict[str, RotatingComponent]:
     """MegaMoe variant of :func:`split_layer_weights`, operating on the fused
     op's single-tensor payload.
@@ -433,6 +434,11 @@ def split_layer_weight_lists(
     its own S-row payload). ``slot_capacity`` then carries the resident
     layer's ``S + R`` so the slots are built at full combined size from the
     R-row template (oversized rebuild; the tail rows are don't-care).
+
+    ``list_layout=True`` builds the slots at ``R`` rows instead of ``S+R``:
+    the fused op is fed its per-expert TensorList form (weight 2-D / scale
+    3-D) with the static experts as views of the resident payload, so the
+    slots only stage the rotating rows and no static D2D gather exists.
     """
     if not mega_supported_quant_type(quant_type):
         raise ValueError(
@@ -490,10 +496,14 @@ def split_layer_weight_lists(
                 slot_capacity = t.shape[0]
             slot_template = static_t
             del t
+        # list layout: the slot only ever holds the R rotating rows (the fused
+        # op receives static entries as resident-payload views, so no combined
+        # S+R capacity and no static D2D gather exist in this mode)
+        slot_rows = num_rotating if list_layout else slot_capacity
         slots = [
             _rebuild_expert_rows(
                 slot_template,
-                slot_capacity,
+                slot_rows,
                 nz=is_nz_tensor(slot_template),
                 transposed_view=False,
                 quant_type=quant_type,

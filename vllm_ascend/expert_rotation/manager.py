@@ -120,6 +120,13 @@ class ExpertRotationManager:
         # prefix) and the fused op receives static entries + slot unbind
         # views spliced into one per-expert list.
         self.mega_mode = False
+        # LIST_LAYOUT experiment: feed MegaMoe its per-expert TensorList form
+        # (weight 2-D / scale 3-D) — static experts enter as zero-copy views
+        # of the resident payload, slots hold only the R rotating rows, and
+        # the per-layer static-prefix D2D gather disappears.
+        self.list_layout = bool(envs.VLLM_ASCEND_ER_LIST_LAYOUT)
+        if self.list_layout:
+            logger.info("[expert_rotation] LIST_LAYOUT enabled: per-expert TensorList form, no static D2D")
         self.layers: dict[int, LayerRotationState] = {}
         # pre-sized mode: per-layer staging module + static->staging param map
         self._staging_modules: dict[int, torch.nn.Module] = {}
@@ -133,7 +140,9 @@ class ExpertRotationManager:
         # device-side copy in parallel with the copy stream's H2D suffix fill
         # (different engines: HBM/vector vs PCIe/SDMA).
         self.d2d_stream = (
-            torch.npu.Stream() if (config.prefetch_enabled and self.merged_gmm) else None
+            torch.npu.Stream()
+            if (config.prefetch_enabled and self.merged_gmm and not self.list_layout)
+            else None
         )
         self._last_served: int | None = None
         self._registered = 0
@@ -497,7 +506,9 @@ class ExpertRotationManager:
         one combined (S+R, ...) tensor per (role, slot) — the merged-GMM
         combined-slot form; at run time the op's weight tensor IS the slot
         view (see :meth:`build_mega_weights`), filled with the static prefix
-        D2D + rotating suffix H2D (see :meth:`_fill_slot`)."""
+        D2D + rotating suffix H2D (see :meth:`_fill_slot`). Under
+        ``list_layout`` the slots are built at R rows only — the static
+        experts reach the op as resident-payload views and no D2D happens."""
         layer = runner.routed_experts
         staging = None
         absorb_all = False
@@ -526,6 +537,7 @@ class ExpertRotationManager:
             slot_capacity=num_local,
             absorb_all=absorb_all,
             verify=self.config.verify_split,
+            list_layout=self.list_layout,
         )
         # Static D2D sources: the layer's (shrunk, or pre-created S-sized)
         # standalone payload tensors per role — they fill the combined slot's
@@ -670,13 +682,19 @@ class ExpertRotationManager:
         slot = self.slot_states[slot_idx]
         # mega mode: slots are combined (S+R) buffers like merged-GMM — the
         # static prefix is D2D-gathered from the resident payload while the
-        # rotating suffix streams H2D from pinned.
-        merged_fill = self.merged_gmm or self.mega_mode
+        # rotating suffix streams H2D from pinned. LIST_LAYOUT breaks that:
+        # the slot is R-row only and is filled whole from pinned (the static
+        # experts ride along as resident-payload views at op-invocation time).
+        merged_fill = (self.merged_gmm or self.mega_mode) and not (
+            self.mega_mode and self.list_layout
+        )
         if self.copy_stream is not None:
             if not merged_fill:
                 with torch.npu.stream(self.copy_stream):
                     self.copy_stream.wait_event(slot.slot_free)
                     for comp in state.components.values():
+                        # LIST_LAYOUT: slot is (R, ...) and copies the pinned
+                        # block whole; legacy split mode: same whole-slot copy
                         copy_storage_slice(
                             self.slot_views[comp.role][slot_idx],
                             comp.pinned.untyped_storage(),
@@ -798,17 +816,23 @@ class ExpertRotationManager:
             w2_scale=pick("w2_scale", weights.w2_scale),
         )
 
-    def build_mega_weights(self, weights, slot_idx: int):
-        """Swap the MegaMoe payload for this slot's combined weight tensors.
+    def build_mega_weights(self, weights, slot_idx: int, moe_instance_id: int):
+        """Swap the MegaMoe payload for this slot's weight tensors.
 
-        CANN 9.2.0's MegaMoe consumes ONE tensor per rank per role (list of
-        exactly one element, dim 0 = local experts); the combined (S+R)-row
-        slot IS that tensor — static prefix and rotating suffix were fused at
-        fill time. No remapping of topk_ids is needed: EP sharding is
-        contiguous, so slot row order matches the global expert ids the op
-        routes by.
+        Stacked form (default): CANN 9.2.0's MegaMoe consumes ONE tensor per
+        rank per role (list of exactly one element, dim 0 = local experts);
+        the combined (S+R)-row slot IS that tensor — static prefix and
+        rotating suffix were fused at fill time.
+
+        LIST_LAYOUT form: the op's per-expert TensorList (weight 2-D, scale
+        3-D; supported on 950PR MXFP alongside the stacked form). The list
+        splices S zero-copy views of the resident payload with R unbind views
+        of the rotating slot — order is expert id order because EP sharding
+        keeps static ids first, so no topk remapping is needed either way.
         """
         from dataclasses import replace
+
+        static_srcs = self.layers[moe_instance_id].static_srcs if self.list_layout else None
 
         def pick(role: str, cur: Any) -> Any:
             if cur is None:
@@ -816,7 +840,12 @@ class ExpertRotationManager:
             views = self.slot_views.get(role)
             if views is None:
                 raise RuntimeError(f"[expert_rotation] no slot view for role {role}")
-            return [views[slot_idx]]
+            slot_t = views[slot_idx]
+            if static_srcs is not None:
+                # unbind: one op per tensor producing all per-expert views,
+                # in local expert-id order (static ids first)
+                return [*static_srcs[role].unbind(0), *slot_t.unbind(0)]
+            return [slot_t]
 
         for bias_role in ("w1_bias", "w2_bias", "w1_offset", "w2_offset"):
             if getattr(weights, bias_role, None) is not None:
