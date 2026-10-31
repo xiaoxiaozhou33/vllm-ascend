@@ -307,6 +307,13 @@ class DeepseekV4Indexer(nn.Module):
         k_dtype = kv_cache_dtype_str_to_dtype(
             self.vllm_config.attention_config.indexer_kv_dtype, vllm_config.model_config
         )
+        # A3 local patch: non-A5 writer quantizes indexer K to int8 + fp16 scale
+        # (device_op.indexer_quant_scatter*); "auto" resolving to model bf16 crashes
+        # aclnnScatterNdUpdateSk (EZ1001). Force int8 on non-A5 SoCs.
+        from vllm_ascend.device.device_config import is_950
+
+        if k_dtype in (torch.bfloat16, torch.half) and not is_950():
+            k_dtype = torch.int8
 
         if self.compress_ratio == 4:
             # TODO(cmq): change the dtype of cache
